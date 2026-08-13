@@ -393,6 +393,110 @@ class DevFlow(commands.Cog):
             logger.error(f"Failed to create/assign GitHub Issue for {view.original_interaction.user}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ 建立或指派 GitHub Issue 時發生錯誤: {e}", ephemeral=True)
 
+    #: Discord emoji to the eight reactions GitHub understands.
+    #:
+    #: GitHub takes no others, so anything not listed here is simply left in
+    #: Discord — silently, because reacting with 🍕 is not an error worth
+    #: telling somebody about.
+    REACTIONS = {
+        "👍": "+1", "👎": "-1", "😄": "laugh", "😆": "laugh",
+        "😕": "confused", "❤️": "heart", "❤": "heart",
+        "🎉": "hooray", "🚀": "rocket", "👀": "eyes",
+    }
+
+    async def _github_for_reaction(self, payload):
+        """The GitHub comment and reaction name a Discord reaction refers to.
+
+        `None` when there is nothing to do: an unmapped emoji, a message that
+        was never synced, or a reaction the bot itself added (it marks synced
+        messages with ✅, which is not something to mirror).
+        """
+        name = str(payload.emoji)
+        content = self.REACTIONS.get(name)
+        if not content:
+            return None
+
+        recorded = store.comment_for_message(payload.message_id)
+        if not recorded:
+            return None
+
+        data = await self._get_user_github_data(str(payload.user_id))
+        token = (data or {}).get("access_token") or self.github_bot_token
+        if not token:
+            return None
+
+        try:
+            gh = await self._run_sync(Github, token)
+            repo = await self._run_sync(gh.get_repo, recorded["repo"])
+            comment = await self._run_sync(repo.get_issue_comment, recorded["comment_id"])
+        except GithubException as error:
+            logger.warning("cannot read comment %s: %s", recorded["comment_id"], error)
+            return None
+        return comment, content
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        if payload.user_id == self.bot.user.id:
+            return
+        found = await self._github_for_reaction(payload)
+        if not found:
+            return
+        comment, content = found
+        try:
+            await self._run_sync(comment.create_reaction, content)
+            logger.info("mirrored %s onto comment %s", content, comment.id)
+        except GithubException as error:
+            logger.warning("could not add reaction %s: %s", content, error)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload):
+        found = await self._github_for_reaction(payload)
+        if not found:
+            return
+        comment, content = found
+
+        # GitHub deletes reactions by their own id, not by name, so the list has
+        # to be walked to find the one this account left.
+        data = await self._get_user_github_data(str(payload.user_id))
+        whoami = (data or {}).get("github_username")
+        try:
+            for reaction in await self._run_sync(comment.get_reactions):
+                if reaction.content != content:
+                    continue
+                if whoami and reaction.user and reaction.user.login != whoami:
+                    continue
+                await self._run_sync(reaction.delete)
+                logger.info("removed %s from comment %s", content, comment.id)
+                break
+        except GithubException as error:
+            logger.warning("could not remove reaction %s: %s", content, error)
+
+    async def _render_for_github(self, message: discord.Message) -> str:
+        """A Discord message as it should read on GitHub.
+
+        `clean_content` turns `<@123>` into the person's Discord nickname, which
+        on GitHub is just a word — it notifies nobody, and a nickname full of
+        decorative characters does not even identify them. Anyone who has run
+        `/github-login` is substituted for their GitHub handle instead, so the
+        mention actually reaches them.
+        """
+        content = message.content or ""
+
+        for user in message.mentions:
+            data = await self._get_user_github_data(str(user.id))
+            handle = (data or {}).get("github_username")
+            replacement = f"@{handle}" if handle else f"@{user.display_name}"
+            content = re.sub(rf"<@!?{user.id}>", replacement, content)
+
+        # Whatever is left of Discord's own syntax would otherwise show up as
+        # raw ids on GitHub.
+        for role in message.role_mentions:
+            content = content.replace(f"<@&{role.id}>", f"@{role.name}")
+        for channel in message.channel_mentions:
+            content = content.replace(f"<#{channel.id}>", f"#{channel.name}")
+
+        return content
+
     async def _issue_from_thread(self, interaction: Interaction):
         """The GitHub issue this thread mirrors, or `None` after explaining why not.
 
@@ -482,7 +586,22 @@ class DevFlow(commands.Cog):
             "user": {"login": issue.user.login if issue.user else "unknown"},
             "labels": [{"name": label.name} for label in issue.labels],
         }
-        thread = await server.announce_issue(self.bot, self.dev_announce_channel, repo_path, payload)
+        # The conversation so far, so the thread does not open empty on an issue
+        # that has been discussed for a week. Capped because a long-running
+        # issue would otherwise post fifty embeds in a row.
+        try:
+            existing = await self._run_sync(lambda: list(issue.get_comments())[-20:])
+        except GithubException:
+            existing = []
+        history = [
+            {"author": c.user.login if c.user else "unknown", "body": c.body or ""}
+            for c in existing
+            if store.SYNC_MARKER not in (c.body or "")
+        ]
+
+        thread = await server.announce_issue(
+            self.bot, self.dev_announce_channel, repo_path, payload, history
+        )
         if thread is None:
             await interaction.followup.send("❌ 建立討論串失敗，看一下 bot 的 log。", ephemeral=True)
             return
@@ -568,7 +687,7 @@ class DevFlow(commands.Cog):
         for message in history:
             if message.author.bot or not (message.clean_content or message.attachments):
                 continue
-            lines.append(f"**{message.author.display_name}：** {message.clean_content}")
+            lines.append(f"**{message.author.display_name}：** {await self._render_for_github(message)}")
             for attachment in message.attachments:
                 lines.append(f"- [{attachment.filename}]({attachment.url})")
 
@@ -967,13 +1086,13 @@ class DevFlow(commands.Cog):
 
         if user_gh_data and user_gh_data.get("access_token"):
             token_to_use = user_gh_data["access_token"]
-            comment_body = message.clean_content
+            comment_body = await self._render_for_github(message)
             using_user_token = True
         else:
             token_to_use = self.github_bot_token
             comment_body = (
                 f"**來自 Discord 使用者 `{message.author.display_name}` 的留言：**\n\n"
-                f"{message.clean_content}"
+                f"{await self._render_for_github(message)}"
             )
 
         if not token_to_use:
@@ -1011,8 +1130,11 @@ class DevFlow(commands.Cog):
             repo = await self._run_sync(gh.get_repo, repo_full_name)
             issue = await self._run_sync(repo.get_issue, number=issue_number)
             
-            await self._run_sync(issue.create_comment, comment_body)
-            
+            created = await self._run_sync(issue.create_comment, comment_body)
+            # Remembered so that a reaction added to this Discord message later
+            # can find the comment it turned into.
+            store.remember_comment(message.id, repo_full_name, created.id)
+
             identity_log = "as user" if using_user_token else "as bot"
             logger.info(f"Synced message from Discord user {message.author.id} ({identity_log}) to GitHub Issue {repo_full_name}#{issue_number}")
             await message.add_reaction("✅")

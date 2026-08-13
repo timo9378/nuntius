@@ -191,13 +191,69 @@ async def github_webhook(request: web.Request) -> web.Response:
 
     action = payload.get("action")
     if event == "issue_comment" and action == "created":
+        # GitHub reports a pull request's conversation comments as
+        # `issue_comment` too, so this covers both without extra work.
         await _handle_comment(request, repo, payload)
     elif event == "issues" and action == "opened":
         await _handle_issue_opened(request, repo, payload)
     elif event == "issues" and action in ("closed", "reopened"):
         await _handle_issue_state(request, repo, payload, closed=action == "closed")
+    elif event == "pull_request":
+        await _handle_pull_request(request, repo, payload, action)
 
     return web.json_response({"message": "accepted"})
+
+
+async def _handle_pull_request(request: web.Request, repo: str, payload: dict, action: str) -> None:
+    """Mirrors a pull request the same way as an issue.
+
+    A PR *is* an issue as far as numbering and comments go, so it reuses the
+    same mapping and the same comment sync. Only the announcement differs, and
+    only in wording — a merged PR and a closed one are not the same news.
+    """
+    pull = payload["pull_request"]
+    number = pull["number"]
+
+    if action == "opened":
+        if store.thread_for_issue(repo, number):
+            return
+        bot = request.app["bot"]
+        cog = bot.get_cog("DevFlow")
+        channel = getattr(cog, "dev_announce_channel", None) if cog else None
+        if channel is None:
+            return
+        await announce_issue(bot, channel, repo, {**pull, "kind": "pull"})
+        return
+
+    if action not in ("closed", "reopened"):
+        return
+
+    thread_id = store.thread_for_issue(repo, number)
+    if not thread_id:
+        return
+
+    merged = bool(pull.get("merged"))
+    closed = action == "closed"
+    if closed:
+        note = (
+            f"🟣 `{repo}#{number}` 已合併,討論串封存了。"
+            if merged
+            else f"🔴 `{repo}#{number}` 被關閉但沒有合併,討論串封存了。"
+        )
+    else:
+        note = f"🔓 `{repo}#{number}` 重新開啟,討論串解除封存。"
+
+    await _post_to_thread(request, thread_id, content=note)
+
+    bot = request.app["bot"]
+    thread = bot.get_channel(int(thread_id))
+    if thread is None:
+        return
+    await _update_announcement(bot, thread, closed=closed)
+    try:
+        await thread.edit(archived=closed)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not set archived=%s on thread %s: %s", closed, thread_id, error)
 
 
 async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -> None:
@@ -230,7 +286,7 @@ async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -
         logger.info("announced %s#%s as thread %s", repo, number, thread.id)
 
 
-async def announce_issue(bot, channel, repo: str, issue: dict):
+async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dict] | None = None):
     """Posts a task card for a GitHub issue and opens a thread under it.
 
     Shared with `/link-issue`, so an issue pulled in by hand and one that
@@ -246,11 +302,12 @@ async def announce_issue(bot, channel, repo: str, issue: dict):
     body = issue.get("body") or ""
     author = issue.get("user", {}).get("login", "unknown")
 
+    is_pull = issue.get("kind") == "pull"
     text, image = _readable_in_discord(body)
     embed = discord.Embed(
-        title=f"🐙 GitHub 上開了一張單",
+        title="🔀 GitHub 上開了一個 PR" if is_pull else "🐙 GitHub 上開了一張單",
         description=text[:1500] or "*（沒有內文）*",
-        colour=0x2DA44E,
+        colour=0x8250DF if is_pull else 0x2DA44E,
     )
     embed.add_field(name="📝 標題", value=title[:1000], inline=False)
     embed.add_field(name="🎯 目標儲存庫", value=f"`{repo}`", inline=False)
@@ -284,6 +341,21 @@ async def announce_issue(bot, channel, repo: str, issue: dict):
     cog = bot.get_cog("DevFlow")
     if cog is not None:
         cog.thread_issue_mappings[str(thread.id)] = {"issue_number": number, "repo": repo}
+
+    # An issue pulled in by hand usually already has a conversation on it. A
+    # thread that starts empty makes you go and read GitHub anyway, which
+    # defeats the point of linking it.
+    for comment in history or []:
+        text, image = _readable_in_discord(comment.get("body") or "")
+        past = discord.Embed(description=text[:4000] or "*（空留言）*", colour=0x57606A)
+        past.set_author(name=f"{comment.get('author', 'unknown')} · 既有留言")
+        if image:
+            past.set_image(url=image)
+        try:
+            await thread.send(embed=past)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not replay a comment into thread %s: %s", thread.id, error)
+            break
 
     return thread
 

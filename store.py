@@ -42,6 +42,21 @@ USER_MAPPINGS_FILE = os.path.join(DATA_DIR, "user_github_mappings.json")
 #: to post into.
 THREAD_MAPPINGS_FILE = os.path.join(DATA_DIR, "thread_issue_mappings.json")
 
+#: Discord message id -> {repo, comment_id}
+#:
+#: Only needed so that a reaction added in Discord can find the GitHub comment
+#: that message became. Kept separate from the thread mappings because it grows
+#: per message rather than per task, and losing it costs nothing but reactions.
+COMMENT_MAPPINGS_FILE = os.path.join(DATA_DIR, "message_comment_mappings.json")
+
+#: How many message→comment pairs to keep.
+#:
+#: This file is the only one that grows without bound — one entry per synced
+#: message, forever. Reactions arrive within minutes of a message in practice,
+#: so the oldest entries are dead weight; trimming keeps the file small enough
+#: that rewriting it on every message stays cheap.
+COMMENT_MAPPING_LIMIT = 2000
+
 # Both files are read and written from the Discord event loop *and* from the
 # aiohttp handlers. The writes are small and rare, so one lock is cheaper than
 # reasoning about which of them can interleave.
@@ -89,6 +104,24 @@ def read_threads() -> dict:
 def write_threads(data: dict) -> None:
     with _lock:
         _write(THREAD_MAPPINGS_FILE, data)
+
+
+def remember_comment(message_id: int, repo_full_name: str, comment_id: int) -> None:
+    """Records which GitHub comment a Discord message became."""
+    with _lock:
+        data = _read(COMMENT_MAPPINGS_FILE)
+        data[str(message_id)] = {"repo": repo_full_name, "comment_id": comment_id}
+        if len(data) > COMMENT_MAPPING_LIMIT:
+            # dicts keep insertion order, and ids only ever increase, so the
+            # front of the file is the oldest.
+            for stale in list(data)[: len(data) - COMMENT_MAPPING_LIMIT]:
+                del data[stale]
+        _write(COMMENT_MAPPINGS_FILE, data)
+
+
+def comment_for_message(message_id: int) -> dict | None:
+    """The GitHub comment a Discord message became, if it is still recorded."""
+    return _read(COMMENT_MAPPINGS_FILE).get(str(message_id))
 
 
 def thread_for_issue(repo_full_name: str, issue_number: int) -> str | None:

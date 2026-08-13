@@ -38,6 +38,10 @@ REQUIRED = ("DISCORD_TOKEN", "GITHUB_BOT_TOKEN", "GITHUB_REPO_OWNER", "GITHUB_RE
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+# Not privileged, but not in the default set either — without it the reaction
+# listeners never fire and mirroring reactions onto GitHub silently does
+# nothing.
+intents.reactions = True
 
 
 class Nuntius(commands.Bot):
