@@ -69,9 +69,40 @@ class Nuntius(commands.Bot):
 
         self.http_runner = await server.start(self, HTTP_HOST, HTTP_PORT)
 
+        # Guild-scoped when a guild is named, and that is worth the setting:
+        # a global sync can take up to an hour to reach clients, so a renamed
+        # command keeps showing up under its old name and looks broken. A guild
+        # sync is immediate.
+        guild_id = os.getenv("DISCORD_GUILD_ID")
+        guild = discord.Object(id=int(guild_id)) if guild_id and guild_id.isdigit() else None
+        if guild is not None:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                # Otherwise the previous global registrations sit alongside the
+                # guild ones and every command appears twice.
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                logger.info("synced %d commands to guild %s", len(synced), guild_id)
+                return
+            except discord.Forbidden:
+                # The bot was invited without `applications.commands`. Falling
+                # through rather than giving up: a slow sync is a nuisance, no
+                # commands at all is a dead bot.
+                logger.warning(
+                    "no permission to register commands on guild %s — re-invite with the "
+                    "applications.commands scope. Falling back to a global sync.",
+                    guild_id,
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.error("guild sync failed: %s", error, exc_info=True)
+
         try:
             synced = await self.tree.sync()
-            logger.info("synced %d application commands", len(synced))
+            logger.info(
+                "synced %d commands globally; this can take up to an hour to reach clients",
+                len(synced),
+            )
         except Exception as error:  # noqa: BLE001
             logger.error("could not sync application commands: %s", error, exc_info=True)
 

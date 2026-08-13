@@ -149,6 +149,15 @@ _MENTION = re.compile(r"(?<![\w/])@([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){
 _COMMIT = re.compile(r"(?<![\w/@])(?=[0-9a-f]{7,40}(?![\w/]))([0-9]*[a-f][0-9a-f]*)", re.IGNORECASE)
 
 
+#: Anything that is already a link: a markdown target, or a bare URL.
+#:
+#: These have to be held out of the substitutions below. A GitHub attachment
+#: URL ends in a UUID, and a UUID's last group is twelve hex characters — which
+#: is indistinguishable from an abbreviated commit SHA. Left unprotected, the
+#: commit pass rewrites the middle of the image URL and the picture 404s.
+_ALREADY_LINKED = re.compile(r"\]\([^)]*\)|<https?://[^>]*>|https?://\S+")
+
+
 def _link_github_syntax(body: str, repo: str) -> str:
     """Turns GitHub's own shorthand into something Discord can act on.
 
@@ -175,11 +184,23 @@ def _link_github_syntax(body: str, repo: str) -> str:
         sha = match.group(1)
         return f"[`{sha[:7]}`](https://github.com/{repo}/commit/{sha})"
 
+    # Existing links are lifted out and put back afterwards, so nothing gets
+    # rewritten inside a URL.
+    kept: list[str] = []
+
+    def stash(match: re.Match) -> str:
+        kept.append(match.group(0))
+        return f"\x00{len(kept) - 1}\x00"
+
+    masked = _ALREADY_LINKED.sub(stash, body)
+
     # Commits first. A Discord mention is `<@` followed by a long run of digits,
     # so substituting mentions first hands the commit pass a snowflake id that
     # looks exactly like a SHA — and it duly turns the middle of the ping into a
     # commit link, leaving `<@[`4349523`](…)>`.
-    return _MENTION.sub(mention, _COMMIT.sub(commit, body))
+    masked = _MENTION.sub(mention, _COMMIT.sub(commit, masked))
+
+    return re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))], masked)
 
 
 def _readable_in_discord(body: str) -> tuple[str, str | None]:
@@ -389,11 +410,23 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     if image:
         embed.set_image(url=image)
 
+    thread_name = f"#{number} {title}"[:100]
     try:
-        announcement = await channel.send(embed=embed)
-        thread = await announcement.create_thread(
-            name=f"#{number} {title}"[:100], auto_archive_duration=10080
-        )
+        if isinstance(channel, discord.ForumChannel):
+            # A forum is the right shape for a backlog: one post per issue,
+            # searchable, sortable by activity, and filterable by tag. A text
+            # channel can only be scrolled, which stops working at about twenty
+            # open issues.
+            #
+            # Labels map onto forum tags by name where the names line up.
+            # Discord allows five per post.
+            available = {tag.name.lower(): tag for tag in channel.available_tags}
+            tags = [available[label.lower()] for label in labels if label.lower() in available][:5]
+            created = await channel.create_thread(name=thread_name, embed=embed, applied_tags=tags)
+            thread = created.thread
+        else:
+            announcement = await channel.send(embed=embed)
+            thread = await announcement.create_thread(name=thread_name, auto_archive_duration=10080)
     except Exception as error:  # noqa: BLE001
         logger.warning("could not announce %s#%s: %s", repo, number, error)
         return None
