@@ -14,6 +14,7 @@
 | `/issue <任務> [repo] [labels] [milestone]` | 在公告頻道貼出任務,附「建立 Issue」「我想協作」「我有問題」三顆鈕。標籤用逗號分隔;標籤和里程碑都是先查再套,打錯的會被略過而不是讓整張單開不出來。 |
 | `/link <編號> [repo]` | 把 GitHub 上**已經存在**的 issue 接進來,建公告和討論串。給那些不是從 Discord 開的單用的。 |
 | `/close [說明]` | 在任務討論串裡執行。算總耗時、把整串對話存成私密 Gist、在 issue 留下連結、關閉 issue、封存討論串。給了說明就多發一則留言,沒給就只是關單。 |
+| `/status <欄位值> [field]` | 移動這張單在 GitHub Projects 看板上的位置。選項會自動完成,直接列出看板自己的欄位值。預設動 `Status`,`Priority` 和 `Size` 也可以。 |
 | `/milestone [標題]` | 在討論串裡設定對應 Issue 的里程碑,留空就是拿掉。標題會先查再套,打錯會列出現有的給你看。 |
 | `/resync [repo] [limit]` | 管理者限定。把儲存庫裡所有開著的 issue 一次接進來,已經有討論串的會跳過,所以重跑是安全的。**不會刪任何東西。** |
 | `/reopen [理由]` | 反過來。重新開啟 issue,討論串解除封存、公告改回「開發中」。給了理由就多發一則留言,並且貼回討論串讓其他人看得到。 |
@@ -49,6 +50,14 @@ docker compose up -d
 2. **Repo 的 webhook** —— payload URL 設成 `https://你的網域/github/webhook`,content type 選 `application/json`,secret 填 `GITHUB_WEBHOOK_SECRET`,事件勾 **Issues** 和 **Issue comments**
 
 沒設 webhook 的話 GitHub → Discord 那個方向就是不會動,而且不會有任何錯誤訊息 —— 只是安靜地不同步。
+
+## GitHub Projects（選用）
+
+`/status` 需要 `GITHUB_BOT_TOKEN` 除了 `repo` 之外還有 `project` scope。Projects v2 **只有 GraphQL API**,REST 完全沒有,所以 PyGithub 碰不到 —— `projects.py` 是為此寫的最小實作。
+
+用的是 bot 的 token 而不是每個人自己的:移動卡片是庶務,而 Projects 需要的 scope 超出 `/login` 要求的範圍,逼所有人重新授權會讓最常用看板的人反而用不到。
+
+**反方向(在看板上拖動 → Discord 更新)還沒做。** Projects v2 的變更沒有儲存庫層級的 webhook,`projects_v2_item` 是組織層級的事件,要在組織設定裡另外掛一個。
 
 ## 資料
 

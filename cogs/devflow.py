@@ -11,6 +11,7 @@ import uuid
 import asyncio
 import functools
 
+import projects
 import store
 from web import server
 
@@ -853,6 +854,82 @@ class DevFlow(commands.Cog):
             await interaction.followup.send("❌ 建立討論串失敗，看一下 bot 的 log。", ephemeral=True)
             return
         await self._ack(interaction, f"✅ `{repo_path}#{number}` 接進來了：<#{thread.id}>")
+
+    async def project_field_autocomplete(self, interaction: Interaction, current: str):
+        """Offers the board's own option names, so nobody has to guess them."""
+        mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
+        token = projects.token()
+        if not mapping or not token:
+            return []
+        field = getattr(interaction.namespace, "field", None) or "Status"
+        try:
+            item = await projects.find_item(token, mapping["repo"], mapping["issue_number"], field)
+        except projects.ProjectError:
+            return []
+        if item is None:
+            return []
+        return [
+            app_commands.Choice(name=name, value=name)
+            for name in item["options"]
+            if current.lower() in name.lower()
+        ][:25]
+
+    @app_commands.command(name="status", description="移動這張單在看板上的位置。")
+    @app_commands.describe(
+        value="要移到哪一欄。",
+        field="看板欄位名稱，預設 Status。Priority 和 Size 也可以。",
+    )
+    @app_commands.autocomplete(value=project_field_autocomplete)
+    async def project_status(self, interaction: Interaction, value: str, field: str = "Status"):
+        """Moves a card on a GitHub Projects v2 board.
+
+        Uses the bot's token rather than the person's. Moving a card is
+        bookkeeping, and Projects needs a scope beyond what `/login` asks for —
+        requiring everyone to re-authorise would put the board out of reach of
+        exactly the people who use it.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
+        if not mapping:
+            await interaction.followup.send(
+                "❌ 這個討論串沒有對應的 GitHub Issue。", ephemeral=True
+            )
+            return
+
+        token = projects.token()
+        if not token:
+            await interaction.followup.send("❌ 沒有設定 GITHUB_BOT_TOKEN。", ephemeral=True)
+            return
+
+        try:
+            item = await projects.find_item(token, mapping["repo"], mapping["issue_number"], field)
+            if item is None:
+                await interaction.followup.send(
+                    f"❌ `{mapping['repo']}#{mapping['issue_number']}` 不在任何看板上"
+                    f"（或那個看板沒有 `{field}` 這個單選欄位）。",
+                    ephemeral=True,
+                )
+                return
+            if item["current"] and item["current"].lower() == value.strip().lower():
+                await self._ack(interaction, f"ℹ️ 本來就是 **{item['current']}**。")
+                return
+            settled = await projects.set_field(token, item, value)
+        except projects.ProjectError as error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            return
+
+        was = item["current"] or "（未設定）"
+        # In the thread, not just to whoever typed: moving a card is a statement
+        # about the work, and the slash command's own reply is ephemeral.
+        try:
+            await interaction.channel.send(
+                f"📋 **{interaction.user.display_name}** 把 `{field}` 從 **{was}** 改成 **{settled}**"
+                f"（{item['project_title']}）"
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not announce the board move: %s", error)
+        await self._ack(interaction, f"✅ `{field}` → **{settled}**")
 
     @app_commands.command(name="milestone", description="設定這個討論串對應 Issue 的里程碑。")
     @app_commands.describe(title="里程碑標題。留空就是拿掉。")
