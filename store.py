@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 
+#: Appended to every GitHub comment this bot creates from a Discord message.
+#:
+#: The loop guard used to compare the comment's author against the bot's own
+#: GitHub account, which breaks the moment the bot posts under a real person's
+#: token — every comment that person writes on GitHub then looks like an echo
+#: and never reaches Discord. That is not an edge case: a one-person instance
+#: uses its owner's PAT, so it is the *default*.
+#:
+#: An HTML comment because GitHub renders markdown — it is invisible in the
+#: issue and survives a round trip through the API unchanged.
+SYNC_MARKER = "<!-- nuntius:from-discord -->"
+
 #: Discord user id -> {access_token, github_username, timestamp}
 #:
 #: Written by the OAuth callback, read when deciding whose GitHub identity a

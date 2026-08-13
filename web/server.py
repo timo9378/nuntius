@@ -27,10 +27,6 @@ GITHUB_API = "https://api.github.com"
 TIMEOUT = aiohttp.ClientTimeout(total=8)
 
 
-def _bot_github_login(app: web.Application) -> str | None:
-    return app.get("bot_github_login")
-
-
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
@@ -159,10 +155,11 @@ async def github_webhook(request: web.Request) -> web.Response:
     payload = await request.json()
     repo = payload.get("repository", {}).get("full_name", "")
 
-    if event == "issue_comment" and payload.get("action") == "created":
+    action = payload.get("action")
+    if event == "issue_comment" and action == "created":
         await _handle_comment(request, repo, payload)
-    elif event == "issues" and payload.get("action") == "closed":
-        await _handle_issue_closed(request, repo, payload)
+    elif event == "issues" and action in ("closed", "reopened"):
+        await _handle_issue_state(request, repo, payload, closed=action == "closed")
 
     return web.json_response({"message": "accepted"})
 
@@ -170,12 +167,18 @@ async def github_webhook(request: web.Request) -> web.Response:
 async def _handle_comment(request: web.Request, repo: str, payload: dict) -> None:
     comment = payload["comment"]
     author = comment["user"]["login"]
+    body = comment["body"] or ""
 
-    # The bot posts Discord messages *to* GitHub. Without this, GitHub tells us
-    # about that comment and we post it straight back into the thread it came
-    # from — every message duplicated, and the duplicate attributed to GitHub.
-    if author == _bot_github_login(request.app):
-        logger.debug("skipping our own comment on %s#%s", repo, payload["issue"]["number"])
+    # The bot posts Discord messages *to* GitHub, and GitHub then tells us about
+    # the comment we just made. Without a guard, every message is duplicated and
+    # the copy is attributed to GitHub.
+    #
+    # Matched on the marker the bot writes, not on the author. Comparing authors
+    # is what the first version did, and it fails exactly where it matters: the
+    # bot posts under a real person's token, so that person's own GitHub
+    # comments look like echoes and never reach Discord.
+    if store.SYNC_MARKER in body:
+        logger.debug("skipping a comment this bot wrote on %s#%s", repo, payload["issue"]["number"])
         return
 
     issue_number = payload["issue"]["number"]
@@ -187,7 +190,7 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
     import discord
 
     embed = discord.Embed(
-        description=comment["body"][:4000],
+        description=body[:4000],
         url=comment["html_url"],
         colour=0x2DA44E,
     )
@@ -200,7 +203,15 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
     await _post_to_thread(request, thread_id, embed=embed)
 
 
-async def _handle_issue_closed(request: web.Request, repo: str, payload: dict) -> None:
+async def _handle_issue_state(
+    request: web.Request, repo: str, payload: dict, *, closed: bool
+) -> None:
+    """Mirrors an issue being closed or reopened onto the Discord side.
+
+    Two things move, not one. Archiving the thread is the visible half, but the
+    announcement in the channel is what people actually scroll past — leaving it
+    saying "開發中" under a closed issue is how a board stops being trusted.
+    """
     issue_number = payload["issue"]["number"]
     thread_id = store.thread_for_issue(repo, issue_number)
     if not thread_id:
@@ -209,15 +220,77 @@ async def _handle_issue_closed(request: web.Request, repo: str, payload: dict) -
     await _post_to_thread(
         request,
         thread_id,
-        content=f"🔒 `{repo}#{issue_number}` 已在 GitHub 關閉,這個討論串封存了。",
+        content=(
+            f"🔒 `{repo}#{issue_number}` 已在 GitHub 關閉,這個討論串封存了。"
+            if closed
+            else f"🔓 `{repo}#{issue_number}` 在 GitHub 被重新開啟,討論串解除封存。"
+        ),
     )
+
     bot = request.app["bot"]
-    channel = bot.get_channel(int(thread_id))
-    if channel is not None:
-        try:
-            await channel.edit(archived=True)
-        except Exception as error:  # noqa: BLE001
-            logger.warning("could not archive thread %s: %s", thread_id, error)
+    thread = bot.get_channel(int(thread_id))
+    if thread is None:
+        return
+
+    await _update_announcement(bot, thread, closed=closed)
+
+    try:
+        # Last, because a thread cannot be posted into once it is archived —
+        # doing this first would silently drop the message above.
+        await thread.edit(archived=closed)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not set archived=%s on thread %s: %s", closed, thread_id, error)
+
+
+async def _update_announcement(bot, thread, *, closed: bool) -> None:
+    """Rewrites the task announcement the thread hangs off.
+
+    A thread started from a message shares that message's id, so the thread id
+    is also the announcement's id — no second mapping needed.
+    """
+    parent = getattr(thread, "parent", None)
+    if parent is None:
+        return
+
+    try:
+        announcement = await parent.fetch_message(thread.id)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("cannot read the announcement for thread %s: %s", thread.id, error)
+        return
+
+    if not announcement.embeds:
+        return
+
+    cog = bot.get_cog("DevFlow")
+    embed = announcement.embeds[0]
+    if closed and cog is not None:
+        # The same routine `/finish-dev` uses, so a task closed from GitHub and
+        # one closed from Discord end up looking identical — including the
+        # elapsed time.
+        embed = cog._update_embed_for_completion(embed)  # noqa: SLF001
+    else:
+        embed = embed.copy()
+        index = next((i for i, f in enumerate(embed.fields) if f.name == "📊 狀態"), -1)
+        value = "🟢 開發中" if not closed else "✅ 已完成"
+        if index != -1:
+            embed.set_field_at(index, name="📊 狀態", value=value, inline=False)
+
+    # Buttons are greyed out on close — pressing "我想協作" on a finished task
+    # opens a thread nobody is watching — and left alone on reopen.
+    #
+    # `view` is omitted rather than passed as None in the reopen case, because
+    # discord.py reads an explicit None as "remove the components", which would
+    # strip the buttons off a task that just came back to life.
+    changes = {"embed": embed}
+    if closed and cog is not None:
+        disabled = cog._disable_buttons(announcement)  # noqa: SLF001
+        if disabled is not None:
+            changes["view"] = disabled
+
+    try:
+        await announcement.edit(**changes)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not update the announcement for thread %s: %s", thread.id, error)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -228,8 +301,9 @@ async def start(bot, host: str, port: int) -> web.AppRunner:
     app = web.Application()
     app["bot"] = bot
 
-    # Asked once, so that every webhook delivery does not cost a round trip to
-    # find out whether the comment is one of ours.
+    # Only to say so in the log. Which account the bot posts under is the first
+    # thing you want to know when comments show up attributed to the wrong
+    # person, and it is not otherwise visible from outside.
     token = os.getenv("GITHUB_BOT_TOKEN")
     if token:
         try:

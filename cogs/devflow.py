@@ -762,7 +762,20 @@ class DevFlow(commands.Cog):
         if message.attachments:
             comment_body += "\n\n**附件：**"
             for attachment in message.attachments:
-                comment_body += f"\n- {attachment.url}"
+                # Images go in as markdown rather than as a bare link, and that
+                # is not cosmetic: GitHub rewrites image sources through its own
+                # camo proxy, which fetches and caches the bytes. A Discord CDN
+                # URL is signed and expires within about a day, so a plain link
+                # is dead by the time anyone reads the issue — the picture only
+                # survives if GitHub is made to copy it.
+                if (attachment.content_type or "").startswith("image/"):
+                    comment_body += f"\n\n![{attachment.filename}]({attachment.url})"
+                else:
+                    comment_body += f"\n- [{attachment.filename}]({attachment.url})"
+
+        # See `store.SYNC_MARKER`: this is what stops the comment coming straight
+        # back through the webhook as if somebody on GitHub had written it.
+        comment_body += f"\n\n{store.SYNC_MARKER}"
 
         try:
             gh = await self._run_sync(Github, token_to_use)
