@@ -149,6 +149,20 @@ _MENTION = re.compile(r"(?<![\w/])@([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){
 _COMMIT = re.compile(r"(?<![\w/@])(?=[0-9a-f]{7,40}(?![\w/]))([0-9]*[a-f][0-9a-f]*)", re.IGNORECASE)
 
 
+#: GitHub label -> forum tag, where the two vocabularies differ.
+#:
+#: Only for the pairs that mean the same thing under different words. Anything
+#: not here still matches by name, which is the common case.
+TAG_ALIASES = {
+    "enhancement": "Feature",
+    "feature": "Feature",
+    "bug": "Bug",
+    "question": "Question",
+    "documentation": "Question",
+    "github_actions": "Backend",
+}
+
+
 #: Anything that is already a link: a markdown target, or a bare URL.
 #:
 #: These have to be held out of the substitutions below. A GitHub attachment
@@ -421,7 +435,18 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
             # Labels map onto forum tags by name where the names line up.
             # Discord allows five per post.
             available = {tag.name.lower(): tag for tag in channel.available_tags}
-            tags = [available[label.lower()] for label in labels if label.lower() in available][:5]
+            tags = []
+            for label in labels:
+                # GitHub's vocabulary and a forum's rarely match word for word —
+                # GitHub ships `enhancement` where a forum tag is more likely to
+                # say `Feature`. Aliases cover the common pairs; anything else
+                # has to match by name.
+                for candidate in (label, TAG_ALIASES.get(label.lower(), "")):
+                    tag = available.get(candidate.lower())
+                    if tag is not None and tag not in tags:
+                        tags.append(tag)
+                        break
+            tags = tags[:5]
             created = await channel.create_thread(name=thread_name, embed=embed, applied_tags=tags)
             thread = created.thread
         else:

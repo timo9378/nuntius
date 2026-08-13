@@ -703,6 +703,82 @@ class DevFlow(commands.Cog):
             return
         await self._ack(interaction, f"✅ `{repo_path}#{number}` 接進來了：<#{thread.id}>")
 
+    @app_commands.command(name="resync", description="[管理者] 把儲存庫裡所有開著的 Issue 都接進來。")
+    @app_commands.describe(
+        repo="儲存庫，格式 owner/name，留空用預設。",
+        limit="最多處理幾張，預設 50。",
+    )
+    async def resync(self, interaction: Interaction, repo: str = None, limit: int = 50):
+        """Bulk-links every open issue that does not already have a thread.
+
+        Owner-only, and skips anything already mapped, so running it twice is
+        safe. It does *not* delete anything: posts left behind by a previous
+        integration are not this bot's to remove, and a command that quietly
+        clears a channel is not one to hand out.
+        """
+        if not await self.bot.is_owner(interaction.user):
+            await interaction.response.send_message("權限不足。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        repo_path = repo or f"{self.repo_owner}/{self.repo_name}"
+        data = await self._get_user_github_data(str(interaction.user.id))
+        token = (data or {}).get("access_token") or self.github_bot_token
+        if not token:
+            await interaction.followup.send("❌ 沒有可用的 GitHub 憑證。", ephemeral=True)
+            return
+        if not self.dev_announce_channel:
+            await interaction.followup.send("❌ 公告頻道沒設定好。", ephemeral=True)
+            return
+
+        try:
+            gh = await self._run_sync(Github, token)
+            gh_repo = await self._run_sync(gh.get_repo, repo_path)
+            issues = await self._run_sync(lambda: list(gh_repo.get_issues(state="open"))[:limit])
+        except GithubException as e:
+            await interaction.followup.send(
+                f"❌ 讀不到 `{repo_path}`：{e.data.get('message', e)}", ephemeral=True
+            )
+            return
+
+        created, skipped, failed = 0, 0, 0
+        for issue in issues:
+            # `get_issues` returns pull requests too — they are issues as far as
+            # the API is concerned, and they get their own announcement when
+            # their webhook arrives.
+            if issue.pull_request is not None:
+                continue
+            if store.thread_for_issue(repo_path, issue.number):
+                skipped += 1
+                continue
+
+            payload = {
+                "number": issue.number,
+                "title": issue.title,
+                "body": issue.body or "",
+                "html_url": issue.html_url,
+                "user": {"login": issue.user.login if issue.user else "unknown"},
+                "labels": [{"name": label.name} for label in issue.labels],
+            }
+            thread = await server.announce_issue(
+                self.bot, self.dev_announce_channel, repo_path, payload
+            )
+            if thread is None:
+                failed += 1
+                continue
+            created += 1
+            # Discord allows a handful of thread creations per few seconds; a
+            # burst of fifty without this gets rate-limited into a crawl and
+            # discord.py sleeps through it in the middle of the loop.
+            await asyncio.sleep(2)
+
+        await interaction.followup.send(
+            f"✅ `{repo_path}` 同步完成：新建 **{created}**、已存在跳過 **{skipped}**"
+            + (f"、失敗 **{failed}**" if failed else "")
+            + "\n\n舊的貼文不會被動到 —— 那是別的整合留下的,要清掉請自己刪。",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="reopen", description="重新開啟這個討論串對應的 Issue。")
     @app_commands.describe(comment="重開的理由，會變成 Issue 上的一則留言。留空就只是重開。")
     async def reopen_dev(self, interaction: Interaction, comment: str = None):
