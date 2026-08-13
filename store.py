@@ -134,6 +134,27 @@ def comment_for_message(message_id: int) -> dict | None:
     return _read(COMMENT_MAPPINGS_FILE).get(str(message_id))
 
 
+def message_for_comment(repo_full_name: str, comment_id: int) -> int | None:
+    """The Discord message a GitHub comment was mirrored into.
+
+    A linear scan rather than a second index: the file is capped at a couple of
+    thousand rows, and a deletion is rare enough that a second copy of the data
+    to keep in step would cost more than it saves.
+    """
+    for message_id, record in _read(COMMENT_MAPPINGS_FILE).items():
+        if record.get("comment_id") == comment_id and record.get("repo") == repo_full_name:
+            return int(message_id)
+    return None
+
+
+def forget_message(message_id: int) -> None:
+    """Drops a message→comment pair, once one side of it is gone."""
+    with _lock:
+        data = _read(COMMENT_MAPPINGS_FILE)
+        if data.pop(str(message_id), None) is not None:
+            _write(COMMENT_MAPPINGS_FILE, data)
+
+
 def thread_for_issue(repo_full_name: str, issue_number: int) -> str | None:
     """Finds the Discord thread mirroring a GitHub issue.
 

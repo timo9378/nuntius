@@ -512,6 +512,105 @@ class DevFlow(commands.Cog):
             return None
         return comment, content
 
+    async def _github_issue_for_thread_id(self, thread_id: int):
+        """The PyGithub issue a thread mirrors, using the bot's own token."""
+        mapping = self.thread_issue_mappings.get(str(thread_id))
+        if not mapping or not self.github_bot_token:
+            return None
+        try:
+            gh = await self._run_sync(Github, self.github_bot_token)
+            repo = await self._run_sync(gh.get_repo, mapping["repo"])
+            return await self._run_sync(repo.get_issue, number=mapping["issue_number"])
+        except GithubException as error:
+            logger.warning("cannot read %s#%s: %s", mapping["repo"], mapping["issue_number"], error)
+            return None
+
+    @commands.Cog.listener()
+    async def on_raw_thread_update(self, payload):
+        """Mirrors a forum post's tags back onto the issue's labels.
+
+        The other half of the label sync. Both directions settle after one hop
+        because each side checks whether the change it is about to make has
+        already been made — see the webhook's label handler for why that is the
+        guard rather than remembering what we just did.
+        """
+        thread = self.bot.get_channel(payload.thread_id)
+        if thread is None or not isinstance(getattr(thread, "parent", None), discord.ForumChannel):
+            return
+
+        issue = await self._github_issue_for_thread_id(payload.thread_id)
+        if issue is None:
+            return
+
+        # Tag name -> GitHub label, via the alias table read backwards. A tag
+        # with no counterpart is left alone rather than invented on GitHub:
+        # creating labels from Discord would let a typo permanently add one to
+        # the repository.
+        reverse = {value.lower(): key for key, value in server.TAG_ALIASES.items()}
+        existing = {label.name.lower(): label.name for label in await self._run_sync(issue.get_labels)}
+        try:
+            available = {
+                label.name.lower(): label.name
+                for label in await self._run_sync(issue.repository.get_labels)
+            }
+        except GithubException:
+            return
+
+        wanted = []
+        for tag in thread.applied_tags:
+            for candidate in (tag.name, reverse.get(tag.name.lower(), "")):
+                if candidate and candidate.lower() in available:
+                    wanted.append(available[candidate.lower()])
+                    break
+
+        if {name.lower() for name in wanted} == set(existing):
+            return
+
+        try:
+            await self._run_sync(issue.set_labels, *wanted)
+            logger.info("labels for #%s -> %s", issue.number, wanted)
+        except GithubException as error:
+            logger.warning("could not set labels on #%s: %s", issue.number, error)
+
+    async def _delete_github_comment(self, message_id: int):
+        """Removes the GitHub comment a deleted Discord message became."""
+        recorded = store.comment_for_message(message_id)
+        if not recorded or not self.github_bot_token:
+            return
+        try:
+            gh = await self._run_sync(Github, self.github_bot_token)
+            repo = await self._run_sync(gh.get_repo, recorded["repo"])
+            issue = await self._run_sync(repo.get_issue, number=recorded["issue_number"])
+            comment = await self._run_sync(issue.get_comment, recorded["comment_id"])
+            await self._run_sync(comment.delete)
+            logger.info("deleted GitHub comment %s", recorded["comment_id"])
+        except GithubException as error:
+            # 404 is the ordinary case: it was already deleted on GitHub, and
+            # that is what told us to delete this side.
+            if error.status != 404:
+                logger.warning("could not delete comment %s: %s", recorded["comment_id"], error)
+        finally:
+            store.forget_message(message_id)
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload):
+        await self._delete_github_comment(payload.message_id)
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload):
+        """Clearing a stretch of a thread at once.
+
+        Serially, with a pause between each: GitHub's secondary rate limit is
+        specifically about bursts of writes, and firing forty deletions
+        concurrently gets the whole batch throttled — after some of them have
+        already gone through, which is the worst place to stop.
+        """
+        for message_id in payload.message_ids:
+            if store.comment_for_message(message_id) is None:
+                continue
+            await self._delete_github_comment(message_id)
+            await asyncio.sleep(1)
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
         if payload.user_id == self.bot.user.id:

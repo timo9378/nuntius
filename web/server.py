@@ -298,10 +298,89 @@ async def github_webhook(request: web.Request) -> web.Response:
         await _handle_issue_opened(request, repo, payload)
     elif event == "issues" and action in ("closed", "reopened"):
         await _handle_issue_state(request, repo, payload, closed=action == "closed")
+    elif event == "issues" and action in ("labeled", "unlabeled"):
+        await _handle_labels(request, repo, payload)
+    elif event == "issue_comment" and action == "deleted":
+        await _handle_comment_deleted(request, repo, payload)
     elif event == "pull_request":
         await _handle_pull_request(request, repo, payload, action)
 
     return web.json_response({"message": "accepted"})
+
+
+def tags_for_labels(channel, labels: list[str]) -> list:
+    """The forum tags that correspond to a set of GitHub labels.
+
+    Shared by the code that creates a post and the code that keeps its tags in
+    step afterwards, so the two cannot disagree about what a label means.
+    """
+    available = {tag.name.lower(): tag for tag in channel.available_tags}
+    tags = []
+    for label in labels:
+        for candidate in (label, TAG_ALIASES.get(label.lower(), "")):
+            tag = available.get(candidate.lower())
+            if tag is not None and tag not in tags:
+                tags.append(tag)
+                break
+    return tags[:5]
+
+
+async def _handle_labels(request: web.Request, repo: str, payload: dict) -> None:
+    """Mirrors a label change onto the forum post's tags."""
+    import discord
+
+    issue = payload["issue"]
+    thread_id = store.thread_for_issue(repo, issue["number"])
+    if not thread_id:
+        return
+
+    bot = request.app["bot"]
+    thread = bot.get_channel(int(thread_id))
+    if thread is None or not isinstance(getattr(thread, "parent", None), discord.ForumChannel):
+        return
+
+    labels = [label["name"] for label in issue.get("labels", [])]
+    wanted = tags_for_labels(thread.parent, labels)
+
+    # Nothing to do when the tags already say what the labels say. This is the
+    # loop guard for the whole two-way arrangement: a change made on either
+    # side settles after one hop, because the echo finds the state already
+    # correct and stops. Comparing the result beats remembering what we just
+    # did — no bookkeeping to get out of step, and it also copes with a change
+    # made while the bot was down.
+    if {tag.id for tag in wanted} == {tag.id for tag in thread.applied_tags}:
+        return
+
+    if not wanted and thread.parent.flags.require_tag:
+        logger.info("%s#%s has no matching tags but the forum demands one; leaving it alone",
+                    repo, issue["number"])
+        return
+
+    try:
+        await thread.edit(applied_tags=wanted)
+        logger.info("tags for %s#%s -> %s", repo, issue["number"], [t.name for t in wanted])
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not set tags on thread %s: %s", thread_id, error)
+
+
+async def _handle_comment_deleted(request: web.Request, repo: str, payload: dict) -> None:
+    """Removes the Discord copy of a comment deleted on GitHub."""
+    comment_id = payload["comment"]["id"]
+    message_id = store.message_for_comment(repo, comment_id)
+    if message_id is None:
+        return
+
+    thread_id = store.thread_for_issue(repo, payload["issue"]["number"])
+    bot = request.app["bot"]
+    thread = bot.get_channel(int(thread_id)) if thread_id else None
+    if thread is not None:
+        try:
+            message = await thread.fetch_message(message_id)
+            await message.delete()
+            logger.info("deleted the Discord copy of %s comment %s", repo, comment_id)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not delete message %s: %s", message_id, error)
+    store.forget_message(message_id)
 
 
 async def _handle_pull_request(request: web.Request, repo: str, payload: dict, action: str) -> None:
@@ -434,19 +513,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
             #
             # Labels map onto forum tags by name where the names line up.
             # Discord allows five per post.
-            available = {tag.name.lower(): tag for tag in channel.available_tags}
-            tags = []
-            for label in labels:
-                # GitHub's vocabulary and a forum's rarely match word for word —
-                # GitHub ships `enhancement` where a forum tag is more likely to
-                # say `Feature`. Aliases cover the common pairs; anything else
-                # has to match by name.
-                for candidate in (label, TAG_ALIASES.get(label.lower(), "")):
-                    tag = available.get(candidate.lower())
-                    if tag is not None and tag not in tags:
-                        tags.append(tag)
-                        break
-            tags = tags[:5]
+            tags = tags_for_labels(channel, labels)
 
             # A forum can be configured to demand a tag on every post, and an
             # issue with no labels then cannot be posted at all — which is how
@@ -454,8 +521,9 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
             # 400 in the log to show for it. Fall back to a named default, or
             # failing that the channel's first tag.
             if not tags and channel.flags.require_tag and channel.available_tags:
-                wanted = os.getenv("DEFAULT_FORUM_TAG", "").lower()
-                tags = [available.get(wanted) or channel.available_tags[0]]
+                named = os.getenv("DEFAULT_FORUM_TAG", "").lower()
+                by_name = {tag.name.lower(): tag for tag in channel.available_tags}
+                tags = [by_name.get(named) or channel.available_tags[0]]
             created = await channel.create_thread(name=thread_name, embed=embed, applied_tags=tags)
             thread = created.thread
         else:
