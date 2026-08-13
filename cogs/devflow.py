@@ -8,6 +8,7 @@ import logging
 import re
 import json
 import uuid 
+import asyncio
 import functools
 
 import store
@@ -16,12 +17,15 @@ from web import server
 logger = logging.getLogger(__name__)
 
 class DevTaskView(ui.View):
-    def __init__(self, cog_instance, original_interaction: Interaction, task_description: str, repo: str = None):
+    def __init__(self, cog_instance, original_interaction: Interaction, task_description: str,
+                 repo: str = None, labels: str = None, milestone: str = None):
         super().__init__(timeout=None)
         self.cog = cog_instance
         self.original_interaction = original_interaction
         self.task_description = task_description
         self.repo_override = repo
+        self.labels = labels
+        self.milestone = milestone
         self.github_issue_url = None
         self.github_issue_number = None
 
@@ -105,6 +109,26 @@ class DevFlow(commands.Cog):
     def _run_sync(self, func, *args, **kwargs):
         return self.bot.loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
+    #: How long a "done" message stays before it removes itself.
+    ACK_SECONDS = 8
+
+    async def _ack(self, interaction: Interaction, text: str):
+        """Confirms an action, then clears the confirmation away.
+
+        A slash command has to answer something, but "✅ done" sitting in the
+        channel with *只有您能看到這個 · 刪除這則訊息* under it is a permanent
+        smudge for a fact that stopped being interesting the moment it was read
+        — and the real result is already visible as a thread, an embed or a
+        state change. Errors do not go through here: those are worth keeping
+        until they are dealt with.
+        """
+        await interaction.followup.send(text, ephemeral=True)
+        await asyncio.sleep(self.ACK_SECONDS)
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass  # already gone, or the interaction token expired
+
     def _load_and_process_mappings(self):
         logger.info(f"Attempting to load and process mappings from '{self.user_mappings_file}'")
         raw_data_from_file = {}
@@ -161,7 +185,7 @@ class DevFlow(commands.Cog):
                 self.user_mappings[key_in_file] = data_value
                 logger.warning(
                     f"Keeping an unclaimed login under key '{key_in_file}' "
-                    f"(github: {data_value.get('github_username')}); ask them to run /github-login again."
+                    f"(github: {data_value.get('github_username')}); ask them to run /login again."
                 )
             else:
                 logger.warning(f"Discarding malformed entry with key '{key_in_file}': {data_value}")
@@ -213,7 +237,7 @@ class DevFlow(commands.Cog):
         else:
             logger.error(f"DevFlow cog: DEV_ANNOUNCE_CHANNEL_ID ('{self.dev_announce_channel_id_str}') is not set or invalid.")
 
-    @app_commands.command(name="github-login", description="授權 Bot 代表您訪問 GitHub。")
+    @app_commands.command(name="login", description="授權 Bot 代表您訪問 GitHub。")
     async def github_login(self, interaction: Interaction):
         if not self.oauth_client_id or not self.oauth_callback_url:
             await interaction.response.send_message("❌ GitHub OAuth 設定不完整。請聯絡管理員。", ephemeral=True)
@@ -255,14 +279,14 @@ class DevFlow(commands.Cog):
         user_data_to_update = {"github_username": cleaned_username}
         self._update_and_save_user_mapping(discord_id_str, user_data_to_update)
         logger.info(f"User {interaction.user} (ID: {discord_id_str}) manually set GitHub username to: {cleaned_username}")
-        await interaction.response.send_message(f"✅ GitHub 用戶名已手動設為：`{cleaned_username}`。要啟用以您名義發布Issue等功能，請使用 `/github-login`。", ephemeral=True)
+        await interaction.response.send_message(f"✅ GitHub 用戶名已手動設為：`{cleaned_username}`。要啟用以您名義發布Issue等功能，請使用 `/login`。", ephemeral=True)
 
     async def repo_autocomplete(self, interaction: Interaction, current: str) -> list[app_commands.Choice[str]]:
         discord_id_str = str(interaction.user.id)
         user_gh_data = await self._get_user_github_data(discord_id_str)
         
         if not user_gh_data or "access_token" not in user_gh_data:
-            return [app_commands.Choice(name="⚠️ 請先使用 /github-login 授權", value="")]
+            return [app_commands.Choice(name="⚠️ 請先使用 /login 授權", value="")]
 
         token = user_gh_data["access_token"]
         try:
@@ -283,13 +307,16 @@ class DevFlow(commands.Cog):
             logger.error(f"Repo autocomplete failed for user {discord_id_str}: {e}", exc_info=True)
             return [app_commands.Choice(name="❌ 無法獲取儲存庫列表", value="")]
 
-    @app_commands.command(name="start-dev", description="宣告一個新的開發任務。")
+    @app_commands.command(name="issue", description="宣告一個新的開發任務。")
     @app_commands.describe(
         task="任務的詳細描述。",
-        repo="要建立 Issue 的儲存庫，留空則使用預設儲存庫。"
+        repo="要建立 Issue 的儲存庫，留空則使用預設儲存庫。",
+        labels="標籤，逗號分隔，例如 bug,enhancement。",
+        milestone="里程碑的標題。",
     )
     @app_commands.autocomplete(repo=repo_autocomplete)
-    async def start_dev(self, interaction: Interaction, task: str, repo: str = None):
+    async def start_dev(self, interaction: Interaction, task: str, repo: str = None,
+                        labels: str = None, milestone: str = None):
         if not self.dev_announce_channel:
             if self.dev_announce_channel_id_str and self.dev_announce_channel_id_str.isdigit():
                 channel_id = int(self.dev_announce_channel_id_str)
@@ -320,7 +347,9 @@ class DevFlow(commands.Cog):
         embed.add_field(name="⏱️ 開始時間", value=f"<t:{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}:F>", inline=False)
         embed.set_footer(text=f"任務發起人 ID: {interaction.user.id}")
         
-        view_buttons = DevTaskView(cog_instance=self, original_interaction=interaction, task_description=task, repo=repo)
+        view_buttons = DevTaskView(cog_instance=self, original_interaction=interaction,
+                                   task_description=task, repo=repo,
+                                   labels=labels, milestone=milestone)
         try:
             await self.dev_announce_channel.send(embed=embed, view=view_buttons)
             await interaction.followup.send(f"✅ 開發任務公告已發布於 {self.dev_announce_channel.mention}", ephemeral=True)
@@ -336,7 +365,7 @@ class DevFlow(commands.Cog):
         discord_id_str = str(view.original_interaction.user.id)
         user_gh_data = await self._get_user_github_data(discord_id_str)
         if not user_gh_data or "access_token" not in user_gh_data:
-            await interaction.response.send_message("❌ 您尚未透過 `/github-login` 授權或授權資料不完整。請先完成授權。", ephemeral=True)
+            await interaction.response.send_message("❌ 您尚未透過 `/login` 授權或授權資料不完整。請先完成授權。", ephemeral=True)
             return
         
         user_token = user_gh_data["access_token"]
@@ -354,11 +383,11 @@ class DevFlow(commands.Cog):
             repo = await self._run_sync(gh.get_repo, repo_path)
         except GithubException as e:
             logger.error(f"Failed to get repo '{repo_path}' with user token: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ 無法存取倉庫 `{repo_path}`。請檢查倉庫是否存在、您是否有權限，或重新執行 `/github-login`。\n錯誤: {e.status} - {e.data.get('message', 'Unknown error')}", ephemeral=True)
+            await interaction.followup.send(f"❌ 無法存取倉庫 `{repo_path}`。請檢查倉庫是否存在、您是否有權限，或重新執行 `/login`。\n錯誤: {e.status} - {e.data.get('message', 'Unknown error')}", ephemeral=True)
             return
         except Exception as e:
             logger.error(f"Failed to init Github or get repo '{repo_path}' with user token: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ 無法使用您的 GitHub 憑證初始化或存取倉庫 `{repo_path}`。請重新執行 `/github-login` 或檢查 Token 權限。", ephemeral=True)
+            await interaction.followup.send(f"❌ 無法使用您的 GitHub 憑證初始化或存取倉庫 `{repo_path}`。請重新執行 `/login` 或檢查 Token 權限。", ephemeral=True)
             return
         issue_title = task_description[:50]
         # The marker matters here as well as on comments: GitHub reports this
@@ -372,8 +401,40 @@ class DevFlow(commands.Cog):
             f"{store.SYNC_MARKER}"
         )
         assignees = [github_username] if github_username else []
+
+        # Labels and a milestone, when `/issue` was given them. Both are
+        # looked up rather than passed through: GitHub refuses the whole
+        # `create_issue` call if a label does not exist, so a typo would lose
+        # the issue entirely instead of just the label.
+        extra = {}
+        wanted = [name.strip() for name in (view.labels or "").split(",") if name.strip()]
+        if wanted:
+            try:
+                available = {label.name.lower(): label.name for label in await self._run_sync(repo.get_labels)}
+                matched = [available[name.lower()] for name in wanted if name.lower() in available]
+                missing = [name for name in wanted if name.lower() not in available]
+                if matched:
+                    extra["labels"] = matched
+                if missing:
+                    logger.info("ignoring labels that do not exist on %s: %s", repo.full_name, missing)
+            except GithubException as error:
+                logger.warning("could not read labels for %s: %s", repo.full_name, error)
+
+        if view.milestone:
+            try:
+                for candidate in await self._run_sync(repo.get_milestones, state="all"):
+                    if candidate.title.lower() == view.milestone.strip().lower():
+                        extra["milestone"] = candidate
+                        break
+                else:
+                    logger.info("no milestone called %r on %s", view.milestone, repo.full_name)
+            except GithubException as error:
+                logger.warning("could not read milestones for %s: %s", repo.full_name, error)
+
         try:
-            created_issue = await self._run_sync(repo.create_issue, title=issue_title, body=issue_body, assignees=assignees)
+            created_issue = await self._run_sync(
+                repo.create_issue, title=issue_title, body=issue_body, assignees=assignees, **extra
+            )
             view.github_issue_url = created_issue.html_url
             view.github_issue_number = created_issue.number
             original_embed = interaction.message.embeds[0].copy()
@@ -402,7 +463,7 @@ class DevFlow(commands.Cog):
             assign_msg = f"並已嘗試將您 (`{github_username}`) 指派。" if github_username else ""
             if backfilled:
                 assign_msg += f" 討論串裡先前的 {backfilled} 則訊息也補上去了。"
-            await interaction.followup.send(f"✅ 成功在 GitHub 建立 Issue #{created_issue.number}！ {assign_msg}", ephemeral=True)
+            await self._ack(interaction, f"✅ 成功在 GitHub 建立 Issue #{created_issue.number}！ {assign_msg}")
         except Exception as e:
             logger.error(f"Failed to create/assign GitHub Issue for {view.original_interaction.user}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ 建立或指派 GitHub Issue 時發生錯誤: {e}", ephemeral=True)
@@ -494,7 +555,7 @@ class DevFlow(commands.Cog):
         `clean_content` turns `<@123>` into the person's Discord nickname, which
         on GitHub is just a word — it notifies nobody, and a nickname full of
         decorative characters does not even identify them. Anyone who has run
-        `/github-login` is substituted for their GitHub handle instead, so the
+        `/login` is substituted for their GitHub handle instead, so the
         mention actually reaches them.
         """
         content = message.content or ""
@@ -524,7 +585,7 @@ class DevFlow(commands.Cog):
         if not mapping:
             await interaction.followup.send(
                 "❌ 這個討論串沒有對應的 GitHub Issue。\n"
-                "如果那張單是直接在 GitHub 上開的,先用 `/link-issue` 把它接進來。",
+                "如果那張單是直接在 GitHub 上開的,先用 `/link` 把它接進來。",
                 ephemeral=True,
             )
             return None, None
@@ -533,7 +594,7 @@ class DevFlow(commands.Cog):
         token = (data or {}).get("access_token") or self.github_bot_token
         if not token:
             await interaction.followup.send(
-                "❌ 沒有可用的 GitHub 憑證。請先 `/github-login`。", ephemeral=True
+                "❌ 沒有可用的 GitHub 憑證。請先 `/login`。", ephemeral=True
             )
             return None, None
 
@@ -549,14 +610,14 @@ class DevFlow(commands.Cog):
             return None, None
         return issue, mapping
 
-    @app_commands.command(name="link-issue", description="把 GitHub 上已經存在的 Issue 接進 Discord。")
+    @app_commands.command(name="link", description="把 GitHub 上已經存在的 Issue 接進 Discord。")
     @app_commands.describe(
         number="Issue 編號。",
         repo="儲存庫，格式 owner/name，留空用預設。",
     )
     @app_commands.autocomplete(repo=repo_autocomplete)
     async def link_issue(self, interaction: Interaction, number: int, repo: str = None):
-        """For issues that were filed on GitHub rather than through `/start-dev`.
+        """For issues that were filed on GitHub rather than through `/issue`.
 
         Deliberately on demand rather than a bulk import: a backlog of
         twenty-odd issues would become twenty-odd announcements and twenty-odd
@@ -569,7 +630,7 @@ class DevFlow(commands.Cog):
         data = await self._get_user_github_data(str(interaction.user.id))
         token = (data or {}).get("access_token") or self.github_bot_token
         if not token:
-            await interaction.followup.send("❌ 沒有可用的 GitHub 憑證。請先 `/github-login`。", ephemeral=True)
+            await interaction.followup.send("❌ 沒有可用的 GitHub 憑證。請先 `/login`。", ephemeral=True)
             return
 
         try:
@@ -598,9 +659,7 @@ class DevFlow(commands.Cog):
                     alive = None
 
             if alive is not None:
-                await interaction.followup.send(
-                    f"ℹ️ `{repo_path}#{number}` 已經有討論串了：<#{existing}>", ephemeral=True
-                )
+                await self._ack(interaction, f"ℹ️ `{repo_path}#{number}` 已經有討論串了：<#{existing}>")
                 return
 
             mappings = store.read_threads()
@@ -642,14 +701,12 @@ class DevFlow(commands.Cog):
         if thread is None:
             await interaction.followup.send("❌ 建立討論串失敗，看一下 bot 的 log。", ephemeral=True)
             return
-        await interaction.followup.send(
-            f"✅ `{repo_path}#{number}` 接進來了：<#{thread.id}>", ephemeral=True
-        )
+        await self._ack(interaction, f"✅ `{repo_path}#{number}` 接進來了：<#{thread.id}>")
 
-    @app_commands.command(name="reopen-dev", description="重新開啟這個討論串對應的 Issue。")
+    @app_commands.command(name="reopen", description="重新開啟這個討論串對應的 Issue。")
     @app_commands.describe(comment="重開的理由，會變成 Issue 上的一則留言。留空就只是重開。")
     async def reopen_dev(self, interaction: Interaction, comment: str = None):
-        """The counterpart to `/finish-dev`.
+        """The counterpart to `/close`.
 
         Only reopens the issue on GitHub. Unarchiving the thread and putting the
         announcement back to "開發中" happen when the `issues.reopened` webhook
@@ -663,9 +720,7 @@ class DevFlow(commands.Cog):
             return
 
         if issue.state == "open":
-            await interaction.followup.send(
-                f"ℹ️ `{mapping['repo']}#{issue.number}` 本來就是開著的。", ephemeral=True
-            )
+            await self._ack(interaction, f"ℹ️ `{mapping['repo']}#{issue.number}` 本來就是開著的。")
             return
 
         try:
@@ -777,7 +832,7 @@ class DevFlow(commands.Cog):
                     assign_message = f"\n❌ 嘗試指派您到 GitHub Issue 時發生錯誤。"
                     logger.error(f"Error assigning {collaborator_username} to Issue #{dev_task_view.github_issue_number} in repo {repo_full_name}: {e}", exc_info=True)
             else:
-                assign_message = f"\n⚠️ 您尚未透過 `/github-login` 授權或您的 GitHub 用戶名未儲存。請先授權後再試。"
+                assign_message = f"\n⚠️ 您尚未透過 `/login` 授權或您的 GitHub 用戶名未儲存。請先授權後再試。"
         else:
             assign_message = "\nℹ️ GitHub Issue 尚未建立，無法指派。"
         try: 
@@ -935,7 +990,7 @@ class DevFlow(commands.Cog):
                     disabled_view.add_item(new_button)
         return disabled_view if disabled_view.children else None
 
-    @app_commands.command(name="finish-dev", description="標記一個開發任務為已完成。")
+    @app_commands.command(name="close", description="標記一個開發任務為已完成。")
     @app_commands.describe(comment="收尾說明，會變成 Issue 上的一則留言。留空就只是關單。")
     async def finish_dev(self, interaction: Interaction, comment: str = None):
         # Step 1: Find the original task message
@@ -979,7 +1034,7 @@ class DevFlow(commands.Cog):
             repo_full_name = mapping_info.get("repo")
 
             if not user_token:
-                error_messages.append("❌ 您尚未透過 `/github-login` 授權，無法以您的名義同步並關閉 Issue。")
+                error_messages.append("❌ 您尚未透過 `/login` 授權，無法以您的名義同步並關閉 Issue。")
             elif issue_number and repo_full_name:
                 try:
                     # 1. Fetch history and generate markdown content
@@ -1047,7 +1102,7 @@ class DevFlow(commands.Cog):
                     logger.error(f"GitHub API Error during archive/sync/close for issue {repo_full_name}#{issue_number}: {e}", exc_info=True)
                     scopes = e.headers.get("X-OAuth-Scopes", "未提供")
                     error_messages.append(f"❌ 發生 GitHub API 錯誤: {e.status} {e.data.get('message', '')}")
-                    error_messages.append(f"ℹ️ 您目前的 Token 權限為: `{scopes}`。請確保其包含 `gist` 權限。若無，請重新執行 `/github-login`。")
+                    error_messages.append(f"ℹ️ 您目前的 Token 權限為: `{scopes}`。請確保其包含 `gist` 權限。若無，請重新執行 `/login`。")
                 except Exception as e:
                     logger.error(f"Unexpected error during GitHub file archive/sync/close for issue {repo_full_name}#{issue_number} by user {discord_id_str}: {e}", exc_info=True)
                     error_messages.append(f"❌ 歸檔或關閉 Issue 時發生未預期的錯誤: {e}")
@@ -1082,7 +1137,7 @@ class DevFlow(commands.Cog):
 
         # --- Send the final report BEFORE archiving, because an archived thread
         #     cannot be posted into ---
-        await interaction.followup.send("\n".join(filter(None, final_report)), ephemeral=True)
+        await self._ack(interaction, "\n".join(filter(None, final_report)))
 
         # --- Archive Thread ---
         if will_archive_thread:
@@ -1137,7 +1192,7 @@ class DevFlow(commands.Cog):
             await message.add_reaction("⚠️")
             try:
                 await message.author.send(
-                    f"您的留言無法同步到 GitHub，因為您尚未透過 `/github-login` 授權，且系統未設定備用同步方案。",
+                    f"您的留言無法同步到 GitHub，因為您尚未透過 `/login` 授權，且系統未設定備用同步方案。",
                     suppress_embeds=True
                 )
             except discord.Forbidden:

@@ -10,19 +10,19 @@
 
 | 指令 | 做的事 |
 | --- | --- |
-| `/github-login` | 綁定你的 GitHub 帳號。綁了之後你在 Discord 講的話會以**你的**身分出現在 GitHub,沒綁就以 bot 的身分代發。 |
-| `/start-dev <任務> [repo]` | 在公告頻道貼出任務,附「建立 Issue」「我想協作」「我有問題」三顆鈕。repo 可以留空用預設,也可以用自動完成挑一個。 |
-| `/link-issue <編號> [repo]` | 把 GitHub 上**已經存在**的 issue 接進來,建公告和討論串。給那些不是從 Discord 開的單用的。 |
-| `/finish-dev [說明]` | 在任務討論串裡執行。算總耗時、把整串對話存成私密 Gist、在 issue 留下連結、關閉 issue、封存討論串。給了說明就多發一則留言,沒給就只是關單。 |
-| `/reopen-dev [理由]` | 反過來。重新開啟 issue,討論串解除封存、公告改回「開發中」。給了理由就多發一則留言,並且貼回討論串讓其他人看得到。 |
+| `/login` | 綁定你的 GitHub 帳號。綁了之後你在 Discord 講的話會以**你的**身分出現在 GitHub,沒綁就以 bot 的身分代發。 |
+| `/issue <任務> [repo] [labels] [milestone]` | 在公告頻道貼出任務,附「建立 Issue」「我想協作」「我有問題」三顆鈕。標籤用逗號分隔;標籤和里程碑都是先查再套,打錯的會被略過而不是讓整張單開不出來。 |
+| `/link <編號> [repo]` | 把 GitHub 上**已經存在**的 issue 接進來,建公告和討論串。給那些不是從 Discord 開的單用的。 |
+| `/close [說明]` | 在任務討論串裡執行。算總耗時、把整串對話存成私密 Gist、在 issue 留下連結、關閉 issue、封存討論串。給了說明就多發一則留言,沒給就只是關單。 |
+| `/reopen [理由]` | 反過來。重新開啟 issue,討論串解除封存、公告改回「開發中」。給了理由就多發一則留言,並且貼回討論串讓其他人看得到。 |
 
-`/finish-dev` 和 `/reopen-dev` 只負責改 GitHub 上的狀態,Discord 這邊的封存和公告是等 GitHub 的 webhook 回來才動的 —— 跟直接在 GitHub 網頁上按關閉走同一條路,兩邊不會各做各的。
+`/close` 和 `/reopen` 只負責改 GitHub 上的狀態,Discord 這邊的封存和公告是等 GitHub 的 webhook 回來才動的 —— 跟直接在 GitHub 網頁上按關閉走同一條路,兩邊不會各做各的。
 
 雙向同步是自動的,不用下指令:
 
 - **Discord → GitHub** — 討論串裡的訊息(含附件)變成 issue 留言。圖片用 markdown 語法送出,GitHub 會自己抓下來快取,所以 Discord 的 CDN 連結過期之後圖還在
 - **GitHub → Discord** — issue 的新留言回到討論串。GitHub 編輯器貼的圖是原始 HTML,會被拆成 Discord 看得懂的形式
-- **在 GitHub 開的新 issue** — 自動在公告頻道長出一張卡和一個討論串,不用手動 `/link-issue`
+- **在 GitHub 開的新 issue** — 自動在公告頻道長出一張卡和一個討論串,不用手動 `/link`
 - **狀態** — issue 關閉時討論串封存、公告改成「已完成」並附上耗時;重新開啟則反過來
 
 **討論串一律封存,不會刪除。** Gist 和 issue 留著紀錄,但刪掉討論串會連帶讓所有貼過的連結失效,而且沒有復原。封存不用成本,想繼續談在裡面發言就會自動解除。
@@ -46,7 +46,7 @@ docker compose up -d
 兩個 JSON 檔,都在 `data/`:
 
 - `thread_issue_mappings.json` —— 討論串 ↔ issue 的對應。**這個掉了,所有進行中的討論串就跟 GitHub 斷了。**
-- `user_github_mappings.json` —— OAuth token。掉了大家要重新 `/github-login`。
+- `user_github_mappings.json` —— OAuth token。掉了大家要重新 `/login`。
 
 compose 已經把 `./data` 掛進去了。備份的話備這個目錄。
 

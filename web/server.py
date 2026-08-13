@@ -38,7 +38,7 @@ async def health(_request: web.Request) -> web.Response:
 
 
 async def github_callback(request: web.Request) -> web.Response:
-    """Completes the OAuth dance `/github-login` starts.
+    """Completes the OAuth dance `/login` starts.
 
     The bot generated a random `state` and remembers which Discord user it
     belongs to. GitHub sends it back here alongside a `code`, which this
@@ -121,7 +121,7 @@ async def github_callback(request: web.Request) -> web.Response:
             "<title>已授權</title>"
             "<body style='font:16px/1.6 system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem'>"
             f"<h1>已授權</h1><p>GitHub 帳號 <b>{username}</b> 已經和你的 Discord 綁定。</p>"
-            "<p>回 Discord 就可以用 <code>/start-dev</code> 了,這一頁可以關掉。</p>"
+            "<p>回 Discord 就可以用 <code>/issue</code> 了,這一頁可以關掉。</p>"
         ),
     )
 
@@ -157,7 +157,7 @@ def _link_github_syntax(body: str, repo: str) -> str:
     things worth clicking are the ones that stop working.
 
     Mentions become real Discord pings where the person has run
-    `/github-login`; the rest become links to their GitHub profile, which is
+    `/login`; the rest become links to their GitHub profile, which is
     still better than a word.
     """
     by_handle = {
@@ -221,8 +221,11 @@ def _signature_matches(secret: str, body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected, header)
 
 
-async def _post_to_thread(request: web.Request, thread_id: str, **kwargs) -> None:
-    """Sends into a Discord thread, using the bot already connected."""
+async def _post_to_thread(request: web.Request, thread_id: str, **kwargs):
+    """Sends into a Discord thread, using the bot already connected.
+
+    Returns the message, so callers that need to remember it can.
+    """
     bot = request.app["bot"]
     channel = bot.get_channel(int(thread_id))
     if channel is None:
@@ -230,8 +233,8 @@ async def _post_to_thread(request: web.Request, thread_id: str, **kwargs) -> Non
             channel = await bot.fetch_channel(int(thread_id))
         except Exception as error:  # noqa: BLE001 - deleted thread, lost access, anything
             logger.warning("cannot reach Discord thread %s: %s", thread_id, error)
-            return
-    await channel.send(**kwargs)
+            return None
+    return await channel.send(**kwargs)
 
 
 async def github_webhook(request: web.Request) -> web.Response:
@@ -320,7 +323,7 @@ async def _handle_pull_request(request: web.Request, repo: str, payload: dict, a
 
 async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -> None:
     """Gives an issue opened on GitHub the same Discord presence as one opened
-    from `/start-dev`.
+    from `/issue`.
 
     Without this the sync is only half a loop: anything a collaborator files
     directly on GitHub is invisible in Discord, which is the gap the retired
@@ -330,7 +333,7 @@ async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -
     number = issue["number"]
 
     if store.SYNC_MARKER in (issue.get("body") or ""):
-        logger.debug("%s#%s came from /start-dev; it already has a thread", repo, number)
+        logger.debug("%s#%s came from /issue; it already has a thread", repo, number)
         return
     if store.thread_for_issue(repo, number):
         logger.debug("%s#%s already has a thread", repo, number)
@@ -351,11 +354,11 @@ async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -
 async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dict] | None = None):
     """Posts a task card for a GitHub issue and opens a thread under it.
 
-    Shared with `/link-issue`, so an issue pulled in by hand and one that
+    Shared with `/link`, so an issue pulled in by hand and one that
     arrived over the webhook look identical in the channel.
 
     The mapping is keyed by the thread id, which for a thread started from a
-    message is that message's id — the same shape `/start-dev` writes.
+    message is that message's id — the same shape `/issue` writes.
     """
     import discord
 
@@ -464,7 +467,14 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
         icon_url=comment["user"].get("avatar_url"),
     )
     embed.set_footer(text=f"{repo}#{issue_number}")
-    await _post_to_thread(request, thread_id, embed=embed)
+    posted = await _post_to_thread(request, thread_id, embed=embed)
+
+    # So that reacting to this message in Discord lands on the GitHub comment it
+    # came from. Only messages going the *other* way were recorded before, which
+    # meant reactions worked on your own words and silently did nothing on
+    # everybody else's — the half you are more likely to want to react to.
+    if posted is not None:
+        store.remember_comment(posted.id, repo, issue_number, comment["id"])
 
 
 async def _handle_issue_state(
@@ -528,7 +538,7 @@ async def _update_announcement(bot, thread, *, closed: bool) -> None:
     cog = bot.get_cog("DevFlow")
     embed = announcement.embeds[0]
     if closed and cog is not None:
-        # The same routine `/finish-dev` uses, so a task closed from GitHub and
+        # The same routine `/close` uses, so a task closed from GitHub and
         # one closed from Discord end up looking identical — including the
         # elapsed time.
         embed = cog._update_embed_for_completion(embed)  # noqa: SLF001
