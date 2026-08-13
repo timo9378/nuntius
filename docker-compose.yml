@@ -1,0 +1,61 @@
+# nuntius
+#
+# The bot on its own needs nothing but an outbound connection to Discord and an
+# inbound path from GitHub. The Docker watching is optional and brings a second
+# container with it; it only starts under the `docker-watch` profile:
+#
+#   docker compose up -d                          # bot only
+#   docker compose --profile docker-watch up -d   # bot + socket proxy
+
+services:
+  nuntius:
+    build: .
+    container_name: nuntius
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      # Only reached when the socket proxy is running; harmless otherwise,
+      # because the Docker cog does not load without WATCH_CONTAINER.
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+    volumes:
+      # The two JSON mapping files. Losing this is losing the link between every
+      # Discord thread and its GitHub issue.
+      - ./data:/app/data
+    ports:
+      # Put a reverse proxy in front and give GitHub the public URL. This is not
+      # HTTPS on its own, and GitHub will not deliver webhooks to plain HTTP on
+      # a public host.
+      - "127.0.0.1:8080:8080"
+    networks: [nuntius-net]
+
+  # ──────────────────────────────────────────────────────────────
+  # Docker access, when the Docker cog is in use.
+  #
+  # The bot never touches /var/run/docker.sock. It talks to this proxy, which
+  # is allowed GET /containers/* and nothing else — enough for logs and
+  # inspect, not enough to start, stop, exec, or run a privileged container.
+  # That severs "bot RCE → host root".
+  #
+  # The restart button needs POST=1 *and* ALLOW_RESTART=1. Turning both on
+  # re-opens that path; it is off by default on purpose.
+  # ──────────────────────────────────────────────────────────────
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.4.1
+    container_name: nuntius-socket-proxy
+    profiles: [docker-watch]
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp # haproxy writes its config here
+    security_opt:
+      - no-new-privileges:true
+    networks: [nuntius-net]
+
+networks:
+  nuntius-net:
+    driver: bridge

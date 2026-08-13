@@ -1,0 +1,9 @@
+# aiohttp is discord.py's own HTTP layer; declared because the webhook and
+# OAuth endpoints import it directly rather than by accident.
+aiohttp>=3.9
+discord.py>=2.3
+PyGithub>=2.0
+python-dotenv>=1.0
+# Only used by the optional Docker cog, but a single small wheel is cheaper
+# than an extras group nobody remembers to install.
+python-on-whales>=0.70
