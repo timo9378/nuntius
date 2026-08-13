@@ -447,6 +447,15 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
                         tags.append(tag)
                         break
             tags = tags[:5]
+
+            # A forum can be configured to demand a tag on every post, and an
+            # issue with no labels then cannot be posted at all — which is how
+            # a bulk import loses every unlabelled issue in one go, with only a
+            # 400 in the log to show for it. Fall back to a named default, or
+            # failing that the channel's first tag.
+            if not tags and channel.flags.require_tag and channel.available_tags:
+                wanted = os.getenv("DEFAULT_FORUM_TAG", "").lower()
+                tags = [available.get(wanted) or channel.available_tags[0]]
             created = await channel.create_thread(name=thread_name, embed=embed, applied_tags=tags)
             thread = created.thread
         else:

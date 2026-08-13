@@ -575,6 +575,25 @@ class DevFlow(commands.Cog):
 
         return content
 
+    async def _thread_exists(self, thread_id: str) -> bool:
+        """Whether a recorded thread is still there.
+
+        A mapping outlives the thread it points at, and a stale one is worse
+        than none: it makes the bot refuse to relink an issue while pointing at
+        a channel nobody can open.
+        """
+        if self.bot.get_channel(int(thread_id)) is not None:
+            return True
+        try:
+            await self.bot.fetch_channel(int(thread_id))
+        except (discord.NotFound, discord.Forbidden):
+            return False
+        except discord.HTTPException:
+            # Transient — better to keep the mapping than to drop a live thread
+            # because Discord hiccuped.
+            return True
+        return True
+
     async def _issue_from_thread(self, interaction: Interaction):
         """The GitHub issue this thread mirrors, or `None` after explaining why not.
 
@@ -649,16 +668,7 @@ class DevFlow(commands.Cog):
             # delete the thread, or delete and recreate the issue, and this used
             # to answer with a link to nothing (`#不明`) and refuse to relink,
             # with no way out short of editing the file by hand.
-            alive = self.bot.get_channel(int(existing))
-            if alive is None:
-                try:
-                    alive = await self.bot.fetch_channel(int(existing))
-                except discord.NotFound:
-                    alive = None
-                except discord.HTTPException:
-                    alive = None
-
-            if alive is not None:
+            if await self._thread_exists(existing):
                 await self._ack(interaction, f"ℹ️ `{repo_path}#{number}` 已經有討論串了：<#{existing}>")
                 return
 
@@ -748,9 +758,20 @@ class DevFlow(commands.Cog):
             # their webhook arrives.
             if issue.pull_request is not None:
                 continue
-            if store.thread_for_issue(repo_path, issue.number):
-                skipped += 1
-                continue
+
+            mapped = store.thread_for_issue(repo_path, issue.number)
+            if mapped:
+                # Unless the thread is gone. Without this, deleting the posts to
+                # start over leaves the mappings behind and every issue is
+                # "skipped" — the import quietly does nothing and there is no
+                # way to redo it short of editing the file.
+                if await self._thread_exists(mapped):
+                    skipped += 1
+                    continue
+                mappings = store.read_threads()
+                mappings.pop(mapped, None)
+                store.write_threads(mappings)
+                self.thread_issue_mappings.pop(mapped, None)
 
             payload = {
                 "number": issue.number,
@@ -760,8 +781,23 @@ class DevFlow(commands.Cog):
                 "user": {"login": issue.user.login if issue.user else "unknown"},
                 "labels": [{"name": label.name} for label in issue.labels],
             }
+            # The conversation so far, same as `/link`. A thread that opens
+            # empty on an issue with eight comments on it is not a mirror of
+            # anything — you still have to go and read GitHub.
+            history = []
+            if issue.comments:
+                try:
+                    recent = await self._run_sync(lambda: list(issue.get_comments())[-20:])
+                    history = [
+                        {"author": c.user.login if c.user else "unknown", "body": c.body or ""}
+                        for c in recent
+                        if store.SYNC_MARKER not in (c.body or "")
+                    ]
+                except GithubException as error:
+                    logger.warning("could not read comments on #%s: %s", issue.number, error)
+
             thread = await server.announce_issue(
-                self.bot, self.dev_announce_channel, repo_path, payload
+                self.bot, self.dev_announce_channel, repo_path, payload, history
             )
             if thread is None:
                 failed += 1
