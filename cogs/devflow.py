@@ -854,6 +854,53 @@ class DevFlow(commands.Cog):
             return
         await self._ack(interaction, f"✅ `{repo_path}#{number}` 接進來了：<#{thread.id}>")
 
+    @app_commands.command(name="milestone", description="設定這個討論串對應 Issue 的里程碑。")
+    @app_commands.describe(title="里程碑標題。留空就是拿掉。")
+    async def set_milestone(self, interaction: Interaction, title: str = None):
+        """Sets or clears the milestone from inside the thread.
+
+        Only touches GitHub. The card in Discord is updated when the
+        `milestoned` webhook comes back — the same path a change made on the
+        GitHub website takes, so the two cannot end up saying different things.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        issue, mapping = await self._issue_from_thread(interaction)
+        if issue is None:
+            return
+
+        if not title:
+            try:
+                await self._run_sync(issue.edit, milestone=None)
+            except GithubException as e:
+                await interaction.followup.send(f"❌ 拿不掉：{e.data.get('message', e)}", ephemeral=True)
+                return
+            await self._ack(interaction, f"✅ `{mapping['repo']}#{issue.number}` 的里程碑拿掉了。")
+            return
+
+        # Looked up rather than passed through: GitHub takes a milestone number,
+        # not a title, and a title that does not exist is a 422 on the whole
+        # edit rather than a helpful message.
+        try:
+            wanted = title.strip().lower()
+            for candidate in await self._run_sync(issue.repository.get_milestones, state="all"):
+                if candidate.title.lower() == wanted:
+                    await self._run_sync(issue.edit, milestone=candidate)
+                    break
+            else:
+                existing = [m.title for m in await self._run_sync(issue.repository.get_milestones, state="open")]
+                await interaction.followup.send(
+                    f"❌ `{mapping['repo']}` 沒有叫 `{title}` 的里程碑。\n"
+                    + (f"現有的：{', '.join(f'`{t}`' for t in existing)}" if existing else "這個儲存庫還沒有任何里程碑。"),
+                    ephemeral=True,
+                )
+                return
+        except GithubException as e:
+            await interaction.followup.send(f"❌ 設定失敗：{e.data.get('message', e)}", ephemeral=True)
+            return
+
+        await self._ack(interaction, f"✅ `{mapping['repo']}#{issue.number}` 的里程碑設成 **{title}**。")
+
     @app_commands.command(name="resync", description="[管理者] 把儲存庫裡所有開著的 Issue 都接進來。")
     @app_commands.describe(
         repo="儲存庫，格式 owner/name，留空用預設。",

@@ -344,12 +344,73 @@ async def github_webhook(request: web.Request) -> web.Response:
         await _handle_issue_state(request, repo, payload, closed=action == "closed")
     elif event == "issues" and action in ("labeled", "unlabeled"):
         await _handle_labels(request, repo, payload)
+    elif event == "issues" and action in ("milestoned", "demilestoned"):
+        await _handle_milestone(request, repo, payload)
     elif event == "issue_comment" and action == "deleted":
         await _handle_comment_deleted(request, repo, payload)
     elif event == "pull_request":
         await _handle_pull_request(request, repo, payload, action)
 
     return web.json_response({"message": "accepted"})
+
+
+#: The embed field milestones live in. A constant because two places have to
+#: agree on it — the one that writes the card and the one that later edits it.
+MILESTONE_FIELD = "🎯 里程碑"
+
+
+def _milestone_text(issue: dict) -> str:
+    milestone = issue.get("milestone")
+    if not milestone:
+        return "*未指定*"
+    due = milestone.get("due_on")
+    return f"**{milestone['title']}**" + (f" · 到期 {due[:10]}" if due else "")
+
+
+async def _handle_milestone(request: web.Request, repo: str, payload: dict) -> None:
+    """Keeps the milestone shown on the card in step with the issue."""
+    import discord
+
+    issue = payload["issue"]
+    thread_id = store.thread_for_issue(repo, issue["number"])
+    if not thread_id:
+        return
+
+    bot = request.app["bot"]
+    thread = bot.get_channel(int(thread_id))
+    if thread is None:
+        return
+
+    parent = getattr(thread, "parent", None)
+    try:
+        if isinstance(parent, discord.ForumChannel):
+            # A forum post's card is the post's own first message.
+            announcement = thread.starter_message or await thread.fetch_message(thread.id)
+        else:
+            announcement = await parent.fetch_message(thread.id)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("cannot read the card for thread %s: %s", thread_id, error)
+        return
+
+    if not announcement.embeds:
+        return
+
+    embed = announcement.embeds[0].copy()
+    text = _milestone_text(issue)
+    index = next((i for i, f in enumerate(embed.fields) if f.name == MILESTONE_FIELD), -1)
+    if index == -1:
+        embed.add_field(name=MILESTONE_FIELD, value=text, inline=False)
+    elif embed.fields[index].value == text:
+        logger.info("milestone on %s#%s is already %s", repo, issue["number"], text)
+        return
+    else:
+        embed.set_field_at(index, name=MILESTONE_FIELD, value=text, inline=False)
+
+    try:
+        await announcement.edit(embed=embed)
+        logger.info("milestone for %s#%s -> %s", repo, issue["number"], text)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not update the milestone on thread %s: %s", thread_id, error)
 
 
 def tags_for_labels(channel, labels: list[str]) -> list:
@@ -553,6 +614,10 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     labels = [label["name"] for label in issue.get("labels", [])]
     if labels:
         embed.add_field(name="🏷️ 標籤", value=", ".join(f"`{name}`" for name in labels), inline=False)
+    # Always present, even when empty: a field that appears and disappears
+    # makes the card jump around, and "沒有" is itself worth knowing on a
+    # board that plans by milestone.
+    embed.add_field(name=MILESTONE_FIELD, value=_milestone_text(issue), inline=False)
     if image:
         embed.set_image(url=image)
 
