@@ -155,6 +155,11 @@ def forget_message(message_id: int) -> None:
             _write(COMMENT_MAPPINGS_FILE, data)
 
 
+def issue_for_thread(thread_id: str | int) -> dict | None:
+    """The GitHub issue a Discord thread mirrors, as `{repo, issue_number}`."""
+    return read_threads().get(str(thread_id))
+
+
 def thread_for_issue(repo_full_name: str, issue_number: int) -> str | None:
     """Finds the Discord thread mirroring a GitHub issue.
 

@@ -16,6 +16,33 @@ from web import server
 
 logger = logging.getLogger(__name__)
 
+#: A link to a Discord channel, thread or message.
+_DISCORD_LINK = re.compile(r"https?://(?:\w+\.)?discord\.com/channels/(\d+)/(\d+)(?:/(\d+))?")
+
+
+def _reference(mapped: dict, message) -> str:
+    """A GitHub reference to the issue a thread mirrors.
+
+    `#12` when it is the same repository as the issue being commented on, and
+    the fully qualified `owner/repo#12` otherwise — the short form silently
+    means the wrong issue when the repositories differ.
+
+    Written as a reference rather than left as a Discord URL because GitHub
+    records `#12` on both issues' timelines, so the link is visible from the
+    other end too. A URL is just a URL.
+    """
+    here = store.issue_for_thread(getattr(message.channel, "id", 0)) or {}
+    same_repo = here.get("repo") == mapped["repo"]
+    return f"#{mapped['issue_number']}" if same_repo else f"{mapped['repo']}#{mapped['issue_number']}"
+
+
+def _thread_url_as_reference(match: re.Match, message) -> str:
+    """Turns a pasted Discord link into an issue reference where one exists."""
+    # The second id is the channel; a third, if present, is a single message
+    # inside it, which still identifies the same thread.
+    mapped = store.issue_for_thread(match.group(2))
+    return _reference(mapped, message) if mapped else match.group(0)
+
 class DevTaskView(ui.View):
     def __init__(self, cog_instance, original_interaction: Interaction, task_description: str,
                  repo: str = None, labels: str = None, milestone: str = None):
@@ -575,7 +602,15 @@ class DevFlow(commands.Cog):
     async def _delete_github_comment(self, message_id: int):
         """Removes the GitHub comment a deleted Discord message became."""
         recorded = store.comment_for_message(message_id)
-        if not recorded or not self.github_bot_token:
+        if not recorded:
+            # Only synced messages have a counterpart. Said out loud because
+            # otherwise "I deleted it and nothing happened" is indistinguishable
+            # from a broken listener — and the usual cause is that the message
+            # predates the mapping being kept at all.
+            logger.debug("message %s has no GitHub comment recorded", message_id)
+            return
+        if not self.github_bot_token:
+            logger.warning("no GITHUB_BOT_TOKEN; cannot delete comment %s", recorded["comment_id"])
             return
         try:
             gh = await self._run_sync(Github, self.github_bot_token)
@@ -670,9 +705,16 @@ class DevFlow(commands.Cog):
         for role in message.role_mentions:
             content = content.replace(f"<@&{role.id}>", f"@{role.name}")
         for channel in message.channel_mentions:
-            content = content.replace(f"<#{channel.id}>", f"#{channel.name}")
+            # A channel mention that happens to be a mirrored thread is a
+            # reference to that issue, and saying so gets GitHub to record the
+            # link on both issues' timelines. Everything else is just a channel.
+            mapped = store.issue_for_thread(channel.id)
+            if mapped:
+                content = content.replace(f"<#{channel.id}>", _reference(mapped, message))
+            else:
+                content = content.replace(f"<#{channel.id}>", f"#{channel.name}")
 
-        return content
+        return _DISCORD_LINK.sub(lambda m: _thread_url_as_reference(m, message), content)
 
     async def _thread_exists(self, thread_id: str) -> bool:
         """Whether a recorded thread is still there.

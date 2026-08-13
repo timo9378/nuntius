@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 
+#: Needed to build a link back into Discord. Without it, cross-references
+#: stay as GitHub links — still useful, just one hop further away.
+GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
+
 #: How long to wait on GitHub. A webhook delivery times out at 10 seconds on
 #: their side, so there is no point holding one open for longer than that.
 TIMEOUT = aiohttp.ClientTimeout(total=8)
@@ -172,6 +176,42 @@ TAG_ALIASES = {
 _ALREADY_LINKED = re.compile(r"\]\([^)]*\)|<https?://[^>]*>|https?://\S+")
 
 
+#: A reference to an issue in the same repository, GitHub's `#12` shorthand.
+#:
+#: Digits only, so a CSS colour (`#fff`) and a heading (`# 標題`) are left
+#: alone. Not preceded by a word character, so `abc#1` is not a reference.
+_ISSUE_REF = re.compile(r"(?<![\w#])#(\d+)\b")
+
+#: A full issue or pull request URL.
+_ISSUE_URL = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)\b")
+
+
+def _point_at_threads(body: str, repo: str) -> str:
+    """Rewrites references to other issues so they open the Discord thread.
+
+    Someone reading in Discord who taps `#12` should land in the conversation
+    about #12, not be bounced to a browser. Where there is no thread for it the
+    reference becomes an ordinary GitHub link, which is what it already meant.
+    """
+    def by_number(match: re.Match) -> str:
+        number = int(match.group(1))
+        thread = store.thread_for_issue(repo, number)
+        if thread:
+            return f"[#{number}](https://discord.com/channels/{GUILD_ID}/{thread})"
+        return f"[#{number}](https://github.com/{repo}/issues/{number})"
+
+    def by_url(match: re.Match) -> str:
+        other, number = match.group(1), int(match.group(2))
+        thread = store.thread_for_issue(other, number)
+        if thread:
+            return f"[{other}#{number}](https://discord.com/channels/{GUILD_ID}/{thread})"
+        return match.group(0)
+
+    if GUILD_ID:
+        body = _ISSUE_URL.sub(by_url, body)
+    return _ISSUE_REF.sub(by_number, body)
+
+
 def _link_github_syntax(body: str, repo: str) -> str:
     """Turns GitHub's own shorthand into something Discord can act on.
 
@@ -197,6 +237,10 @@ def _link_github_syntax(body: str, repo: str) -> str:
     def commit(match: re.Match) -> str:
         sha = match.group(1)
         return f"[`{sha[:7]}`](https://github.com/{repo}/commit/{sha})"
+
+    # Cross-references first, while the URLs are still bare — the masking below
+    # would otherwise hide them from this pass.
+    body = _point_at_threads(body, repo)
 
     # Existing links are lifted out and put back afterwards, so nothing gets
     # rewritten inside a URL.
@@ -336,7 +380,12 @@ async def _handle_labels(request: web.Request, repo: str, payload: dict) -> None
 
     bot = request.app["bot"]
     thread = bot.get_channel(int(thread_id))
-    if thread is None or not isinstance(getattr(thread, "parent", None), discord.ForumChannel):
+    if thread is None:
+        logger.info("labels on %s#%s: thread %s is not in cache", repo, issue["number"], thread_id)
+        return
+    if not isinstance(getattr(thread, "parent", None), discord.ForumChannel):
+        logger.info("labels on %s#%s: %s is not a forum post, nothing to tag",
+                    repo, issue["number"], thread_id)
         return
 
     labels = [label["name"] for label in issue.get("labels", [])]
@@ -349,6 +398,10 @@ async def _handle_labels(request: web.Request, repo: str, payload: dict) -> None
     # did — no bookkeeping to get out of step, and it also copes with a change
     # made while the bot was down.
     if {tag.id for tag in wanted} == {tag.id for tag in thread.applied_tags}:
+        logger.info(
+            "labels on %s#%s already match the post's tags (%s), nothing to do",
+            repo, issue["number"], [tag.name for tag in wanted] or "none",
+        )
         return
 
     if not wanted and thread.parent.flags.require_tag:
