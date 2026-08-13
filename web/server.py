@@ -41,13 +41,9 @@ async def github_callback(request: web.Request) -> web.Response:
     """Completes the OAuth dance `/github-login` starts.
 
     The bot generated a random `state` and remembers which Discord user it
-    belongs to. GitHub sends it back here alongside a `code`; this exchanges the
-    code for a token and files it under that same `state`, which is the key the
-    bot looks for on its next read.
-
-    Keeping that contract rather than tidying it is deliberate — the cog's
-    existing lookup works, and changing both halves at once would mean nothing
-    left to compare against if the move went wrong.
+    belongs to. GitHub sends it back here alongside a `code`, which this
+    exchanges for a token and files against that person — see the comment at
+    the write for why it resolves the state here rather than leaving it.
     """
     code = request.query.get("code")
     state = request.query.get("state")
@@ -87,14 +83,36 @@ async def github_callback(request: web.Request) -> web.Response:
         ) as response:
             username = (await response.json()).get("login")
 
-    users = store.read_users()
-    users[state] = {
+    record = {
         "access_token": token,
         "github_username": username,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+    # Filed under the Discord id straight away.
+    #
+    # The version this was ported from wrote it under the OAuth `state` and left
+    # the bot to translate that to a person on its next read. That only worked
+    # if the bot still remembered which login the state belonged to — and it
+    # remembers in memory, so any restart in the window between clicking the
+    # link and the next message lost the login. Worse, it did not lose it
+    # quietly: the loader treats a key it cannot explain as junk and deletes it.
+    #
+    # The callback now runs in the same process as the bot, so it can just ask.
+    cog = request.app["bot"].get_cog("DevFlow")
+    discord_id = cog.pending_oauth_states.pop(state, None) if cog else None
+
+    users = store.read_users()
+    users[discord_id or state] = record
     store.write_users(users)
-    logger.info("stored a GitHub token for %s", username)
+
+    if cog is not None and discord_id:
+        cog.user_mappings[discord_id] = record
+    logger.info(
+        "stored a GitHub token for %s (%s)",
+        username,
+        f"discord {discord_id}" if discord_id else "unclaimed — the bot restarted mid-login",
+    )
 
     return web.Response(
         content_type="text/html",
@@ -118,6 +136,50 @@ async def github_callback(request: web.Request) -> web.Response:
 #: apart here or the reader sees `<img width="467" … />` as literal text.
 _HTML_IMAGE = re.compile(r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"'][^>]*>", re.IGNORECASE)
 _MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
+
+#: A GitHub @mention. Handles are letters, digits and single hyphens.
+_MENTION = re.compile(r"(?<![\w/])@([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})\b")
+
+#: A bare commit SHA. Seven characters is GitHub's own shortest abbreviation.
+#:
+#: At least one `a`–`f` is required, which rules out plain numbers — a run of
+#: seven digits is far more likely to be a quantity, an id, or a year range than
+#: a commit. `@` is excluded from the left so that a handle like `@deadbeef` is
+#: left for the mention pass.
+_COMMIT = re.compile(r"(?<![\w/@])(?=[0-9a-f]{7,40}(?![\w/]))([0-9]*[a-f][0-9a-f]*)", re.IGNORECASE)
+
+
+def _link_github_syntax(body: str, repo: str) -> str:
+    """Turns GitHub's own shorthand into something Discord can act on.
+
+    GitHub renders `@somebody` as a link and a bare SHA as a commit link. Discord
+    renders neither, so a comment arrives as a wall of flat text — the very
+    things worth clicking are the ones that stop working.
+
+    Mentions become real Discord pings where the person has run
+    `/github-login`; the rest become links to their GitHub profile, which is
+    still better than a word.
+    """
+    by_handle = {
+        (record.get("github_username") or "").lower(): discord_id
+        for discord_id, record in store.read_users().items()
+        if discord_id.isdigit() and record.get("github_username")
+    }
+
+    def mention(match: re.Match) -> str:
+        handle = match.group(1)
+        discord_id = by_handle.get(handle.lower())
+        return f"<@{discord_id}>" if discord_id else f"[@{handle}](https://github.com/{handle})"
+
+    def commit(match: re.Match) -> str:
+        sha = match.group(1)
+        return f"[`{sha[:7]}`](https://github.com/{repo}/commit/{sha})"
+
+    # Commits first. A Discord mention is `<@` followed by a long run of digits,
+    # so substituting mentions first hands the commit pass a snowflake id that
+    # looks exactly like a SHA — and it duly turns the middle of the ping into a
+    # commit link, leaving `<@[`4349523`](…)>`.
+    return _MENTION.sub(mention, _COMMIT.sub(commit, body))
 
 
 def _readable_in_discord(body: str) -> tuple[str, str | None]:
@@ -304,6 +366,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
 
     is_pull = issue.get("kind") == "pull"
     text, image = _readable_in_discord(body)
+    text = _link_github_syntax(text, repo)
     embed = discord.Embed(
         title="🔀 GitHub 上開了一個 PR" if is_pull else "🐙 GitHub 上開了一張單",
         description=text[:1500] or "*（沒有內文）*",
@@ -347,6 +410,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     # defeats the point of linking it.
     for comment in history or []:
         text, image = _readable_in_discord(comment.get("body") or "")
+        text = _link_github_syntax(text, repo)
         past = discord.Embed(description=text[:4000] or "*（空留言）*", colour=0x57606A)
         past.set_author(name=f"{comment.get('author', 'unknown')} · 既有留言")
         if image:
@@ -386,6 +450,7 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
     import discord
 
     text, image = _readable_in_discord(body)
+    text = _link_github_syntax(text, repo)
     embed = discord.Embed(
         description=text[:4000],
         url=comment["html_url"],

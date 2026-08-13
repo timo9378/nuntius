@@ -148,10 +148,24 @@ class DevFlow(commands.Cog):
             # Case 2: The key is already a Discord ID, representing a valid, existing mapping.
             elif key_in_file.isdigit() and isinstance(data_value, dict) and "access_token" in data_value: 
                 self.user_mappings[key_in_file] = data_value # Keep this valid mapping.
-            # Case 3: The key is neither a pending state nor a valid Discord ID mapping. It's old/invalid data.
+            # Case 3: a key that is neither a pending state nor a Discord id.
+            #
+            # Kept, not discarded, as long as it carries a token. This used to
+            # delete them, which quietly destroyed real logins: a login filed
+            # under its OAuth state stops being explainable the moment the bot
+            # restarts, because the state lives in memory. The callback files by
+            # Discord id now, so this only catches leftovers from before that —
+            # and throwing away somebody's authorisation is a much worse outcome
+            # than keeping a stray line in a file.
+            elif isinstance(data_value, dict) and "access_token" in data_value:
+                self.user_mappings[key_in_file] = data_value
+                logger.warning(
+                    f"Keeping an unclaimed login under key '{key_in_file}' "
+                    f"(github: {data_value.get('github_username')}); ask them to run /github-login again."
+                )
             else:
-                logger.warning(f"Discarding old or malformed entry with key '{key_in_file}': {data_value}")
-                needs_resave = True # Mark for resave to ensure this invalid data is purged.
+                logger.warning(f"Discarding malformed entry with key '{key_in_file}': {data_value}")
+                needs_resave = True
 
         # After iterating through the entire file, if we processed a new login or discarded old data,
         # we save the now-clean `self.user_mappings` back to the file.
@@ -428,7 +442,10 @@ class DevFlow(commands.Cog):
         try:
             gh = await self._run_sync(Github, token)
             repo = await self._run_sync(gh.get_repo, recorded["repo"])
-            comment = await self._run_sync(repo.get_issue_comment, recorded["comment_id"])
+            # Through the issue: `Repository` has no way to fetch a single
+            # issue comment by id — `get_comment` there is for commit comments.
+            issue = await self._run_sync(repo.get_issue, number=recorded["issue_number"])
+            comment = await self._run_sync(issue.get_comment, recorded["comment_id"])
         except GithubException as error:
             logger.warning("cannot read comment %s: %s", recorded["comment_id"], error)
             return None
@@ -567,10 +584,30 @@ class DevFlow(commands.Cog):
 
         existing = store.thread_for_issue(repo_path, number)
         if existing:
-            await interaction.followup.send(
-                f"ℹ️ `{repo_path}#{number}` 已經有討論串了：<#{existing}>", ephemeral=True
-            )
-            return
+            # Only if the thread is still there. A mapping outlives the thread —
+            # delete the thread, or delete and recreate the issue, and this used
+            # to answer with a link to nothing (`#不明`) and refuse to relink,
+            # with no way out short of editing the file by hand.
+            alive = self.bot.get_channel(int(existing))
+            if alive is None:
+                try:
+                    alive = await self.bot.fetch_channel(int(existing))
+                except discord.NotFound:
+                    alive = None
+                except discord.HTTPException:
+                    alive = None
+
+            if alive is not None:
+                await interaction.followup.send(
+                    f"ℹ️ `{repo_path}#{number}` 已經有討論串了：<#{existing}>", ephemeral=True
+                )
+                return
+
+            mappings = store.read_threads()
+            mappings.pop(existing, None)
+            store.write_threads(mappings)
+            self.thread_issue_mappings.pop(existing, None)
+            logger.info("dropped the mapping for thread %s; it no longer exists", existing)
 
         if not self.dev_announce_channel:
             await interaction.followup.send("❌ 公告頻道沒設定好。", ephemeral=True)
@@ -1133,7 +1170,7 @@ class DevFlow(commands.Cog):
             created = await self._run_sync(issue.create_comment, comment_body)
             # Remembered so that a reaction added to this Discord message later
             # can find the comment it turned into.
-            store.remember_comment(message.id, repo_full_name, created.id)
+            store.remember_comment(message.id, repo_full_name, issue_number, created.id)
 
             identity_log = "as user" if using_user_token else "as bot"
             logger.info(f"Synced message from Discord user {message.author.id} ({identity_log}) to GitHub Issue {repo_full_name}#{issue_number}")

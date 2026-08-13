@@ -106,11 +106,21 @@ def write_threads(data: dict) -> None:
         _write(THREAD_MAPPINGS_FILE, data)
 
 
-def remember_comment(message_id: int, repo_full_name: str, comment_id: int) -> None:
-    """Records which GitHub comment a Discord message became."""
+def remember_comment(
+    message_id: int, repo_full_name: str, issue_number: int, comment_id: int
+) -> None:
+    """Records which GitHub comment a Discord message became.
+
+    The issue number is stored alongside because PyGithub reaches a comment
+    through its issue, not through the repository.
+    """
     with _lock:
         data = _read(COMMENT_MAPPINGS_FILE)
-        data[str(message_id)] = {"repo": repo_full_name, "comment_id": comment_id}
+        data[str(message_id)] = {
+            "repo": repo_full_name,
+            "issue_number": issue_number,
+            "comment_id": comment_id,
+        }
         if len(data) > COMMENT_MAPPING_LIMIT:
             # dicts keep insertion order, and ids only ever increase, so the
             # front of the file is the oldest.
