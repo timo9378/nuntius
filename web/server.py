@@ -192,10 +192,100 @@ async def github_webhook(request: web.Request) -> web.Response:
     action = payload.get("action")
     if event == "issue_comment" and action == "created":
         await _handle_comment(request, repo, payload)
+    elif event == "issues" and action == "opened":
+        await _handle_issue_opened(request, repo, payload)
     elif event == "issues" and action in ("closed", "reopened"):
         await _handle_issue_state(request, repo, payload, closed=action == "closed")
 
     return web.json_response({"message": "accepted"})
+
+
+async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -> None:
+    """Gives an issue opened on GitHub the same Discord presence as one opened
+    from `/start-dev`.
+
+    Without this the sync is only half a loop: anything a collaborator files
+    directly on GitHub is invisible in Discord, which is the gap the retired
+    `discord-sync.yml` workflow used to cover.
+    """
+    issue = payload["issue"]
+    number = issue["number"]
+
+    if store.SYNC_MARKER in (issue.get("body") or ""):
+        logger.debug("%s#%s came from /start-dev; it already has a thread", repo, number)
+        return
+    if store.thread_for_issue(repo, number):
+        logger.debug("%s#%s already has a thread", repo, number)
+        return
+
+    bot = request.app["bot"]
+    cog = bot.get_cog("DevFlow")
+    channel = getattr(cog, "dev_announce_channel", None) if cog else None
+    if channel is None:
+        logger.warning("no announce channel configured; %s#%s gets no thread", repo, number)
+        return
+
+    thread = await announce_issue(bot, channel, repo, issue)
+    if thread is not None:
+        logger.info("announced %s#%s as thread %s", repo, number, thread.id)
+
+
+async def announce_issue(bot, channel, repo: str, issue: dict):
+    """Posts a task card for a GitHub issue and opens a thread under it.
+
+    Shared with `/link-issue`, so an issue pulled in by hand and one that
+    arrived over the webhook look identical in the channel.
+
+    The mapping is keyed by the thread id, which for a thread started from a
+    message is that message's id — the same shape `/start-dev` writes.
+    """
+    import discord
+
+    number = issue["number"]
+    title = issue.get("title") or f"#{number}"
+    body = issue.get("body") or ""
+    author = issue.get("user", {}).get("login", "unknown")
+
+    text, image = _readable_in_discord(body)
+    embed = discord.Embed(
+        title=f"🐙 GitHub 上開了一張單",
+        description=text[:1500] or "*（沒有內文）*",
+        colour=0x2DA44E,
+    )
+    embed.add_field(name="📝 標題", value=title[:1000], inline=False)
+    embed.add_field(name="🎯 目標儲存庫", value=f"`{repo}`", inline=False)
+    embed.add_field(name="📊 狀態", value="🟢 開發中", inline=False)
+    embed.add_field(
+        name="🔗 GitHub Issue",
+        value=f"[#{number}]({issue['html_url']}) · 由 {author} 開立",
+        inline=False,
+    )
+    labels = [label["name"] for label in issue.get("labels", [])]
+    if labels:
+        embed.add_field(name="🏷️ 標籤", value=", ".join(f"`{name}`" for name in labels), inline=False)
+    if image:
+        embed.set_image(url=image)
+
+    try:
+        announcement = await channel.send(embed=embed)
+        thread = await announcement.create_thread(
+            name=f"#{number} {title}"[:100], auto_archive_duration=10080
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not announce %s#%s: %s", repo, number, error)
+        return None
+
+    mappings = store.read_threads()
+    mappings[str(thread.id)] = {"issue_number": number, "repo": repo}
+    store.write_threads(mappings)
+
+    # The cog keeps its own copy in memory and only re-reads on a miss, so it
+    # would not see this until the next restart.
+    cog = bot.get_cog("DevFlow")
+    if cog is not None:
+        cog.thread_issue_mappings[str(thread.id)] = {"issue_number": number, "repo": repo}
+
+    return thread
 
 
 async def _handle_comment(request: web.Request, repo: str, payload: dict) -> None:

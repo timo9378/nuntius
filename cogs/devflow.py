@@ -11,6 +11,7 @@ import uuid
 import functools
 
 import store
+from web import server
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +347,16 @@ class DevFlow(commands.Cog):
             await interaction.followup.send(f"❌ 無法使用您的 GitHub 憑證初始化或存取倉庫 `{repo_path}`。請重新執行 `/github-login` 或檢查 Token 權限。", ephemeral=True)
             return
         issue_title = task_description[:50]
-        issue_body = f"{task_description}\n\n---\n*此 Issue 由 Discord 使用者 {view.original_interaction.user.display_name} (ID: {view.original_interaction.user.id}) 透過 Bot 自動建立。*"
+        # The marker matters here as well as on comments: GitHub reports this
+        # issue back through the `issues.opened` webhook a moment later, and
+        # without it the bot would announce in Discord a task that already has
+        # an announcement — the one the button was pressed on.
+        issue_body = (
+            f"{task_description}\n\n---\n"
+            f"*此 Issue 由 Discord 使用者 {view.original_interaction.user.display_name} "
+            f"(ID: {view.original_interaction.user.id}) 透過 Bot 自動建立。*\n\n"
+            f"{store.SYNC_MARKER}"
+        )
         assignees = [github_username] if github_username else []
         try:
             created_issue = await self._run_sync(repo.create_issue, title=issue_title, body=issue_body, assignees=assignees)
@@ -382,6 +392,158 @@ class DevFlow(commands.Cog):
         except Exception as e:
             logger.error(f"Failed to create/assign GitHub Issue for {view.original_interaction.user}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ 建立或指派 GitHub Issue 時發生錯誤: {e}", ephemeral=True)
+
+    async def _issue_from_thread(self, interaction: Interaction):
+        """The GitHub issue this thread mirrors, or `None` after explaining why not.
+
+        Shared by the commands that act on an existing task, so they all refuse
+        in the same words instead of each inventing their own.
+        """
+        mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
+        if not mapping:
+            await interaction.followup.send(
+                "❌ 這個討論串沒有對應的 GitHub Issue。\n"
+                "如果那張單是直接在 GitHub 上開的,先用 `/link-issue` 把它接進來。",
+                ephemeral=True,
+            )
+            return None, None
+
+        data = await self._get_user_github_data(str(interaction.user.id))
+        token = (data or {}).get("access_token") or self.github_bot_token
+        if not token:
+            await interaction.followup.send(
+                "❌ 沒有可用的 GitHub 憑證。請先 `/github-login`。", ephemeral=True
+            )
+            return None, None
+
+        try:
+            gh = await self._run_sync(Github, token)
+            repo = await self._run_sync(gh.get_repo, mapping["repo"])
+            issue = await self._run_sync(repo.get_issue, number=mapping["issue_number"])
+        except GithubException as e:
+            await interaction.followup.send(
+                f"❌ 讀不到 `{mapping['repo']}#{mapping['issue_number']}`：{e.data.get('message', e)}",
+                ephemeral=True,
+            )
+            return None, None
+        return issue, mapping
+
+    @app_commands.command(name="link-issue", description="把 GitHub 上已經存在的 Issue 接進 Discord。")
+    @app_commands.describe(
+        number="Issue 編號。",
+        repo="儲存庫，格式 owner/name，留空用預設。",
+    )
+    @app_commands.autocomplete(repo=repo_autocomplete)
+    async def link_issue(self, interaction: Interaction, number: int, repo: str = None):
+        """For issues that were filed on GitHub rather than through `/start-dev`.
+
+        Deliberately on demand rather than a bulk import: a backlog of
+        twenty-odd issues would become twenty-odd announcements and twenty-odd
+        threads nobody is reading. The GitHub list is the tracker; a Discord
+        thread is for the one you are actually talking about.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        repo_path = repo or f"{self.repo_owner}/{self.repo_name}"
+        data = await self._get_user_github_data(str(interaction.user.id))
+        token = (data or {}).get("access_token") or self.github_bot_token
+        if not token:
+            await interaction.followup.send("❌ 沒有可用的 GitHub 憑證。請先 `/github-login`。", ephemeral=True)
+            return
+
+        try:
+            gh = await self._run_sync(Github, token)
+            gh_repo = await self._run_sync(gh.get_repo, repo_path)
+            issue = await self._run_sync(gh_repo.get_issue, number=number)
+        except GithubException as e:
+            await interaction.followup.send(
+                f"❌ 讀不到 `{repo_path}#{number}`：{e.data.get('message', e)}", ephemeral=True
+            )
+            return
+
+        existing = store.thread_for_issue(repo_path, number)
+        if existing:
+            await interaction.followup.send(
+                f"ℹ️ `{repo_path}#{number}` 已經有討論串了：<#{existing}>", ephemeral=True
+            )
+            return
+
+        if not self.dev_announce_channel:
+            await interaction.followup.send("❌ 公告頻道沒設定好。", ephemeral=True)
+            return
+
+        # The same shape the webhook hands over, so both routes produce an
+        # identical card.
+        payload = {
+            "number": issue.number,
+            "title": issue.title,
+            "body": issue.body or "",
+            "html_url": issue.html_url,
+            "user": {"login": issue.user.login if issue.user else "unknown"},
+            "labels": [{"name": label.name} for label in issue.labels],
+        }
+        thread = await server.announce_issue(self.bot, self.dev_announce_channel, repo_path, payload)
+        if thread is None:
+            await interaction.followup.send("❌ 建立討論串失敗，看一下 bot 的 log。", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"✅ `{repo_path}#{number}` 接進來了：<#{thread.id}>", ephemeral=True
+        )
+
+    @app_commands.command(name="reopen-dev", description="重新開啟這個討論串對應的 Issue。")
+    @app_commands.describe(comment="重開的理由，會變成 Issue 上的一則留言。留空就只是重開。")
+    async def reopen_dev(self, interaction: Interaction, comment: str = None):
+        """The counterpart to `/finish-dev`.
+
+        Only reopens the issue on GitHub. Unarchiving the thread and putting the
+        announcement back to "開發中" happen when the `issues.reopened` webhook
+        comes back, which is the same path a reopen done on the GitHub website
+        takes — one implementation, so the two cannot drift apart.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        issue, mapping = await self._issue_from_thread(interaction)
+        if issue is None:
+            return
+
+        if issue.state == "open":
+            await interaction.followup.send(
+                f"ℹ️ `{mapping['repo']}#{issue.number}` 本來就是開著的。", ephemeral=True
+            )
+            return
+
+        try:
+            # The reason first, so it is above the state change in the issue's
+            # timeline rather than under it.
+            if comment:
+                await self._run_sync(
+                    issue.create_comment,
+                    f"{comment}\n\n*— {interaction.user.display_name}，於 Discord 重新開啟此任務時留下*"
+                    f"\n\n{store.SYNC_MARKER}",
+                )
+            await self._run_sync(issue.edit, state="open")
+        except GithubException as e:
+            await interaction.followup.send(
+                f"❌ 重新開啟失敗：{e.data.get('message', e)}", ephemeral=True
+            )
+            return
+
+        issue_url = f"https://github.com/{mapping['repo']}/issues/{issue.number}"
+        await interaction.followup.send(
+            f"🔓 [{mapping['repo']}#{issue.number}]({issue_url}) 已重新開啟。\n"
+            "討論串和公告會在 GitHub 的通知回來時一起更新。",
+            ephemeral=True,
+        )
+        # In the thread, not just to whoever typed: the slash command's own
+        # reply is ephemeral, so without this nobody else sees why the task came
+        # back — which is the whole point of writing a reason.
+        if comment:
+            try:
+                await interaction.channel.send(
+                    f"🔓 **{interaction.user.display_name}** 重新開啟了這張單：\n>>> {comment}"
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.warning("could not echo the reopen reason into the thread: %s", error)
 
     async def _backfill_thread(self, announcement: discord.Message, repo, issue) -> int:
         """Copies anything already said in the thread onto the freshly made issue.
@@ -618,7 +780,8 @@ class DevFlow(commands.Cog):
         return disabled_view if disabled_view.children else None
 
     @app_commands.command(name="finish-dev", description="標記一個開發任務為已完成。")
-    async def finish_dev(self, interaction: Interaction):
+    @app_commands.describe(comment="收尾說明，會變成 Issue 上的一則留言。留空就只是關單。")
+    async def finish_dev(self, interaction: Interaction, comment: str = None):
         # Step 1: Find the original task message
         original_message = await self._get_original_message(interaction)
         if not original_message:
@@ -706,11 +869,21 @@ class DevFlow(commands.Cog):
                     archive_url = created_gist.html_url
                     github_sync_success = True
 
-                    # 4. Post link to archive in the issue
-                    final_comment = f"📜 **Discord Conversation Archived**\n\nThe full conversation from the associated Discord thread has been archived as a secret Gist and can be viewed here:\n\n➡️ **[View Archive]({archive_url})**\n\n*This issue was closed by {interaction.user.display_name} upon task completion.*"
+                    # 4. Whatever the person typed, as its own comment — before
+                    # the archive note, so the reason for closing reads above
+                    # the bookkeeping rather than under it.
+                    if comment:
+                        await self._run_sync(
+                            issue.create_comment,
+                            f"{comment}\n\n*— {interaction.user.display_name}，於 Discord 關閉此任務時留下*"
+                            f"\n\n{store.SYNC_MARKER}",
+                        )
+
+                    # 5. Post link to archive in the issue
+                    final_comment = f"📜 **Discord Conversation Archived**\n\nThe full conversation from the associated Discord thread has been archived as a secret Gist and can be viewed here:\n\n➡️ **[View Archive]({archive_url})**\n\n*This issue was closed by {interaction.user.display_name} upon task completion.*\n\n{store.SYNC_MARKER}"
                     await self._run_sync(issue.create_comment, final_comment)
-                    
-                    # 5. Close the issue
+
+                    # 6. Close the issue
                     await self._run_sync(issue.edit, state='closed')
                     issue_closed_success = True
 
