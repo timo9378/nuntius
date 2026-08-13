@@ -931,8 +931,142 @@ class DevFlow(commands.Cog):
             logger.warning("could not announce the board move: %s", error)
         await self._ack(interaction, f"✅ `{field}` → **{settled}**")
 
+    async def milestone_autocomplete(self, interaction: Interaction, current: str):
+        """Lists the repository's own milestones.
+
+        Without this you have to type the title exactly, and the only feedback
+        for getting it wrong is an error after the fact — which is why nobody
+        found this command.
+        """
+        mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
+        if not mapping or not self.github_bot_token:
+            return []
+        try:
+            gh = await self._run_sync(Github, self.github_bot_token)
+            repo = await self._run_sync(gh.get_repo, mapping["repo"])
+            titles = [m.title for m in await self._run_sync(repo.get_milestones, state="open")]
+        except GithubException:
+            return []
+        return [
+            app_commands.Choice(name=title, value=title)
+            for title in titles
+            if current.lower() in title.lower()
+        ][:25]
+
+    async def label_autocomplete(self, interaction: Interaction, current: str):
+        """The repository's own labels, so nobody types one that does not exist."""
+        mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
+        if not mapping or not self.github_bot_token:
+            return []
+        try:
+            gh = await self._run_sync(Github, self.github_bot_token)
+            repo = await self._run_sync(gh.get_repo, mapping["repo"])
+            names = [label.name for label in await self._run_sync(repo.get_labels)]
+        except GithubException:
+            return []
+        return [
+            app_commands.Choice(name=name, value=name)
+            for name in names
+            if current.lower() in name.lower()
+        ][:25]
+
+    @app_commands.command(name="label", description="加上或拿掉這張單的標籤。")
+    @app_commands.describe(name="標籤名稱。再按一次同一個就是拿掉。")
+    @app_commands.autocomplete(name=label_autocomplete)
+    async def toggle_label(self, interaction: Interaction, name: str):
+        """Toggles a label, from the repository's existing set only.
+
+        Never creates one. A label typed from Discord would be a permanent
+        addition to the repository's vocabulary made by a typo — and the forum
+        tags are the other half of that vocabulary, so it would drift out of
+        step immediately.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        issue, mapping = await self._issue_from_thread(interaction)
+        if issue is None:
+            return
+
+        try:
+            available = {
+                label.name.lower(): label.name
+                for label in await self._run_sync(issue.repository.get_labels)
+            }
+        except GithubException as e:
+            await interaction.followup.send(f"❌ 讀不到標籤清單：{e.data.get('message', e)}", ephemeral=True)
+            return
+
+        wanted = available.get(name.strip().lower())
+        if not wanted:
+            await interaction.followup.send(
+                f"❌ `{mapping['repo']}` 沒有叫 `{name}` 的標籤。\n"
+                f"現有的：{', '.join(f'`{n}`' for n in available.values())}",
+                ephemeral=True,
+            )
+            return
+
+        current = {label.name.lower() for label in issue.labels}
+        try:
+            if wanted.lower() in current:
+                await self._run_sync(issue.remove_from_labels, wanted)
+                verb = "拿掉"
+            else:
+                await self._run_sync(issue.add_to_labels, wanted)
+                verb = "加上"
+        except GithubException as e:
+            await interaction.followup.send(f"❌ {verb}失敗：{e.data.get('message', e)}", ephemeral=True)
+            return
+
+        await self._ack(interaction, f"✅ {verb} `{wanted}`,論壇標籤會跟著更新。")
+
+    @app_commands.command(name="assign", description="指派或取消指派這張單的負責人。")
+    @app_commands.describe(member="Discord 上的人。再按一次同一個人就是取消指派。")
+    async def assign(self, interaction: Interaction, member: discord.Member):
+        """Toggles an assignee, translating the Discord user into a GitHub one.
+
+        A toggle rather than separate add and remove commands: the thing you
+        want to know before acting is "is this person on it", and the card
+        already says so — so one command that flips the state is enough.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        issue, mapping = await self._issue_from_thread(interaction)
+        if issue is None:
+            return
+
+        data = await self._get_user_github_data(str(member.id))
+        handle = (data or {}).get("github_username")
+        if not handle:
+            await interaction.followup.send(
+                f"❌ {member.display_name} 還沒綁 GitHub 帳號,請他先跑一次 `/login`。\n"
+                "沒綁的話我不知道他在 GitHub 上是誰。",
+                ephemeral=True,
+            )
+            return
+
+        current = {user.login.lower() for user in issue.assignees}
+        try:
+            if handle.lower() in current:
+                await self._run_sync(issue.remove_from_assignees, handle)
+                verb = "取消指派"
+            else:
+                await self._run_sync(issue.add_to_assignees, handle)
+                verb = "指派"
+        except GithubException as e:
+            # The usual cause: the person has no write access, and GitHub
+            # silently accepts only collaborators as assignees.
+            await interaction.followup.send(
+                f"❌ {verb}失敗：{e.data.get('message', e)}\n"
+                f"`{handle}` 有這個儲存庫的權限嗎?GitHub 只接受協作者當負責人。",
+                ephemeral=True,
+            )
+            return
+
+        await self._ack(interaction, f"✅ {verb} `{handle}`,卡片會在 GitHub 通知回來時更新。")
+
     @app_commands.command(name="milestone", description="設定這個討論串對應 Issue 的里程碑。")
     @app_commands.describe(title="里程碑標題。留空就是拿掉。")
+    @app_commands.autocomplete(title=milestone_autocomplete)
     async def set_milestone(self, interaction: Interaction, title: str = None):
         """Sets or clears the milestone from inside the thread.
 

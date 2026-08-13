@@ -155,15 +155,17 @@ _COMMIT = re.compile(r"(?<![\w/@])(?=[0-9a-f]{7,40}(?![\w/]))([0-9]*[a-f][0-9a-f
 
 #: GitHub label -> forum tag, where the two vocabularies differ.
 #:
-#: Only for the pairs that mean the same thing under different words. Anything
-#: not here still matches by name, which is the common case.
+#: Nearly empty on purpose. The human labels were renamed on GitHub to match the
+#: forum's tags exactly (`enhancement` became `Feature`, and so on), so they
+#: match by name and need no entry here.
+#:
+#: What is left is Dependabot's. Those three are created and reapplied by the
+#: bot whichever way you rename them, so they cannot join the shared vocabulary
+#: — and they describe dependency updates, which is backend work.
 TAG_ALIASES = {
-    "enhancement": "Feature",
-    "feature": "Feature",
-    "bug": "Bug",
-    "question": "Question",
-    "documentation": "Question",
+    "dependencies": "Backend",
     "github_actions": "Backend",
+    "rust": "Backend",
 }
 
 
@@ -346,6 +348,8 @@ async def github_webhook(request: web.Request) -> web.Response:
         await _handle_labels(request, repo, payload)
     elif event == "issues" and action in ("milestoned", "demilestoned"):
         await _handle_milestone(request, repo, payload)
+    elif event == "issues" and action in ("assigned", "unassigned"):
+        await _handle_assignees(request, repo, payload)
     elif event == "issue_comment" and action == "deleted":
         await _handle_comment_deleted(request, repo, payload)
     elif event == "pull_request":
@@ -358,6 +362,20 @@ async def github_webhook(request: web.Request) -> web.Response:
 #: agree on it — the one that writes the card and the one that later edits it.
 MILESTONE_FIELD = "🎯 里程碑"
 
+#: The embed field assignees live in.
+ASSIGNEE_FIELD = "👤 負責人"
+
+
+def _assignee_text(issue: dict) -> str:
+    """Who is on the hook, as GitHub knows them.
+
+    Deliberately the GitHub handles rather than Discord mentions: not everyone
+    on an issue has run `/login`, and a card that names some people and pings
+    others reads as if the unpinged ones matter less.
+    """
+    names = [user["login"] for user in issue.get("assignees", []) if user]
+    return ", ".join(f"`{name}`" for name in names) if names else "*未指定*"
+
 
 def _milestone_text(issue: dict) -> str:
     milestone = issue.get("milestone")
@@ -367,50 +385,100 @@ def _milestone_text(issue: dict) -> str:
     return f"**{milestone['title']}**" + (f" · 到期 {due[:10]}" if due else "")
 
 
-async def _handle_milestone(request: web.Request, repo: str, payload: dict) -> None:
-    """Keeps the milestone shown on the card in step with the issue."""
+async def _card_for(bot, thread_id: str):
+    """The message carrying an issue's card, whichever channel shape it is in.
+
+    A forum post's card is the post's own opening message, and a text channel's
+    is the announcement the thread hangs off. Both share the thread's id, which
+    is why one lookup covers both.
+    """
     import discord
 
+    thread = bot.get_channel(int(thread_id))
+    if thread is None:
+        return None
+
+    parent = getattr(thread, "parent", None)
+    try:
+        if isinstance(parent, discord.ForumChannel):
+            return thread.starter_message or await thread.fetch_message(thread.id)
+        return await parent.fetch_message(thread.id)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("cannot read the card for thread %s: %s", thread_id, error)
+        return None
+
+
+async def _update_card_field(
+    request: web.Request, repo: str, payload: dict, name: str, text: str
+) -> None:
+    """Rewrites one field of an issue's card, or leaves it alone if unchanged."""
     issue = payload["issue"]
     thread_id = store.thread_for_issue(repo, issue["number"])
     if not thread_id:
         return
 
-    bot = request.app["bot"]
-    thread = bot.get_channel(int(thread_id))
-    if thread is None:
+    card = await _card_for(request.app["bot"], thread_id)
+    if card is None or not card.embeds:
         return
 
-    parent = getattr(thread, "parent", None)
-    try:
-        if isinstance(parent, discord.ForumChannel):
-            # A forum post's card is the post's own first message.
-            announcement = thread.starter_message or await thread.fetch_message(thread.id)
-        else:
-            announcement = await parent.fetch_message(thread.id)
-    except Exception as error:  # noqa: BLE001
-        logger.warning("cannot read the card for thread %s: %s", thread_id, error)
+    embed = card.embeds[0].copy()
+    index = next((i for i, f in enumerate(embed.fields) if f.name == name), -1)
+    if index != -1 and embed.fields[index].value == text:
+        logger.info("%s on %s#%s is already %s", name, repo, issue["number"], text)
         return
 
-    if not announcement.embeds:
-        return
-
-    embed = announcement.embeds[0].copy()
-    text = _milestone_text(issue)
-    index = next((i for i, f in enumerate(embed.fields) if f.name == MILESTONE_FIELD), -1)
     if index == -1:
-        embed.add_field(name=MILESTONE_FIELD, value=text, inline=False)
-    elif embed.fields[index].value == text:
-        logger.info("milestone on %s#%s is already %s", repo, issue["number"], text)
-        return
+        embed.add_field(name=name, value=text, inline=False)
     else:
-        embed.set_field_at(index, name=MILESTONE_FIELD, value=text, inline=False)
+        embed.set_field_at(index, name=name, value=text, inline=False)
 
     try:
-        await announcement.edit(embed=embed)
-        logger.info("milestone for %s#%s -> %s", repo, issue["number"], text)
+        await card.edit(embed=embed)
+        logger.info("%s for %s#%s -> %s", name, repo, issue["number"], text)
     except Exception as error:  # noqa: BLE001
-        logger.warning("could not update the milestone on thread %s: %s", thread_id, error)
+        logger.warning("could not update %s on thread %s: %s", name, thread_id, error)
+
+
+async def _handle_milestone(request: web.Request, repo: str, payload: dict) -> None:
+    await _update_card_field(
+        request, repo, payload, MILESTONE_FIELD, _milestone_text(payload["issue"])
+    )
+
+
+async def _handle_assignees(request: web.Request, repo: str, payload: dict) -> None:
+    issue = payload["issue"]
+    await _update_card_field(request, repo, payload, ASSIGNEE_FIELD, _assignee_text(issue))
+
+    # Assignment is the one field change worth interrupting somebody for: being
+    # put on a task is a request, not a detail. The others (labels, milestone)
+    # update the card silently, because nobody needs to be told the moment a
+    # card gets a tag.
+    thread_id = store.thread_for_issue(repo, issue["number"])
+    if not thread_id:
+        return
+
+    who = (payload.get("assignee") or {}).get("login")
+    if not who:
+        return
+
+    # Pinged where the handle is known, named otherwise — a mention only
+    # reaches someone who has run `/login`.
+    by_handle = {
+        (record.get("github_username") or "").lower(): discord_id
+        for discord_id, record in store.read_users().items()
+        if discord_id.isdigit() and record.get("github_username")
+    }
+    discord_id = by_handle.get(who.lower())
+    mention = f"<@{discord_id}>" if discord_id else f"`{who}`"
+
+    assigned = payload.get("action") == "assigned"
+    await _post_to_thread(
+        request,
+        thread_id,
+        content=(
+            f"👤 {mention} 被指派了這張單。" if assigned else f"👤 {mention} 不再負責這張單。"
+        ),
+    )
 
 
 def tags_for_labels(channel, labels: list[str]) -> list:
@@ -617,6 +685,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     # Always present, even when empty: a field that appears and disappears
     # makes the card jump around, and "沒有" is itself worth knowing on a
     # board that plans by milestone.
+    embed.add_field(name=ASSIGNEE_FIELD, value=_assignee_text(issue), inline=False)
     embed.add_field(name=MILESTONE_FIELD, value=_milestone_text(issue), inline=False)
     if image:
         embed.set_image(url=image)
