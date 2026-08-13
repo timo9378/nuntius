@@ -629,6 +629,56 @@ class DevFlow(commands.Cog):
             store.forget_message(message_id)
 
     @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload):
+        """Carries an edit through to the GitHub comment the message became."""
+        data = payload.data or {}
+
+        # Discord fires an edit when it finishes unfurling a link and attaches
+        # the preview — the text never changed. Those updates carry embeds and
+        # no `content`, so requiring the field keeps them out.
+        if "content" not in data:
+            return
+
+        # The bot's own messages in a thread are the GitHub side already
+        # mirrored in; editing one is this sync landing, not a person typing.
+        if (data.get("author") or {}).get("id") == str(self.bot.user.id):
+            return
+
+        recorded = store.comment_for_message(payload.message_id)
+        if not recorded or not self.github_bot_token:
+            return
+
+        channel = self.bot.get_channel(payload.channel_id)
+        if channel is None:
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+
+        body = await self._render_for_github(message)
+        if message.attachments:
+            body += "\n\n**附件：**"
+            for attachment in message.attachments:
+                if (attachment.content_type or "").startswith("image/"):
+                    body += f"\n\n![{attachment.filename}]({attachment.url})"
+                else:
+                    body += f"\n- [{attachment.filename}]({attachment.url})"
+        body += f"\n\n{store.SYNC_MARKER}"
+
+        try:
+            gh = await self._run_sync(Github, self.github_bot_token)
+            repo = await self._run_sync(gh.get_repo, recorded["repo"])
+            issue = await self._run_sync(repo.get_issue, number=recorded["issue_number"])
+            comment = await self._run_sync(issue.get_comment, recorded["comment_id"])
+            if comment.body == body:
+                return
+            await self._run_sync(comment.edit, body)
+            logger.info("edited GitHub comment %s", recorded["comment_id"])
+        except GithubException as error:
+            logger.warning("could not edit comment %s: %s", recorded["comment_id"], error)
+
+    @commands.Cog.listener()
     async def on_raw_message_delete(self, payload):
         await self._delete_github_comment(payload.message_id)
 

@@ -350,6 +350,8 @@ async def github_webhook(request: web.Request) -> web.Response:
         await _handle_milestone(request, repo, payload)
     elif event == "issues" and action in ("assigned", "unassigned"):
         await _handle_assignees(request, repo, payload)
+    elif event == "issue_comment" and action == "edited":
+        await _handle_comment_edited(request, repo, payload)
     elif event == "issue_comment" and action == "deleted":
         await _handle_comment_deleted(request, repo, payload)
     elif event == "pull_request":
@@ -543,6 +545,55 @@ async def _handle_labels(request: web.Request, repo: str, payload: dict) -> None
         logger.info("tags for %s#%s -> %s", repo, issue["number"], [t.name for t in wanted])
     except Exception as error:  # noqa: BLE001
         logger.warning("could not set tags on thread %s: %s", thread_id, error)
+
+
+async def _handle_comment_edited(request: web.Request, repo: str, payload: dict) -> None:
+    """Rewrites the Discord copy when a GitHub comment is edited.
+
+    Skipped for comments this bot wrote: those are a Discord message already,
+    and rewriting the Discord side from them would fight the edit that caused
+    them.
+    """
+    import discord
+
+    comment = payload["comment"]
+    body = comment["body"] or ""
+    if store.SYNC_MARKER in body:
+        return
+
+    message_id = store.message_for_comment(repo, comment["id"])
+    if message_id is None:
+        return
+
+    thread_id = store.thread_for_issue(repo, payload["issue"]["number"])
+    if not thread_id:
+        return
+    thread = request.app["bot"].get_channel(int(thread_id))
+    if thread is None:
+        return
+
+    text, image = _readable_in_discord(body)
+    text = _link_github_syntax(text, repo)
+    embed = discord.Embed(
+        description=text[:4000],
+        url=comment["html_url"],
+        colour=0x2DA44E,
+    )
+    embed.set_author(
+        name=f"{comment['user']['login']} 在 GitHub 留言（已編輯）",
+        url=comment["html_url"],
+        icon_url=comment["user"].get("avatar_url"),
+    )
+    embed.set_footer(text=f"{repo}#{payload['issue']['number']}")
+    if image:
+        embed.set_image(url=image)
+
+    try:
+        message = await thread.fetch_message(message_id)
+        await message.edit(embed=embed)
+        logger.info("updated the Discord copy of %s comment %s", repo, comment["id"])
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not edit message %s: %s", message_id, error)
 
 
 async def _handle_comment_deleted(request: web.Request, repo: str, payload: dict) -> None:
