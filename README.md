@@ -12,12 +12,15 @@
 | --- | --- |
 | `/github-login` | 綁定你的 GitHub 帳號。綁了之後你在 Discord 講的話會以**你的**身分出現在 GitHub,沒綁就以 bot 的身分代發。 |
 | `/start-dev <任務> [repo]` | 在公告頻道貼出任務,附「建立 Issue」「我想協作」「我有問題」三顆鈕。repo 可以留空用預設,也可以用自動完成挑一個。 |
-| `/finish-dev` | 在任務討論串裡執行。算總耗時、把整串對話存成私密 Gist、在 issue 留下連結、關閉 issue、刪掉討論串。 |
+| `/finish-dev` | 在任務討論串裡執行。算總耗時、把整串對話存成私密 Gist、在 issue 留下連結、關閉 issue、封存討論串。 |
 
 雙向同步是自動的,不用下指令:
 
-- **Discord → GitHub** — 討論串裡的訊息(含附件)變成 issue 留言
-- **GitHub → Discord** — issue 的新留言回到討論串,issue 關閉時討論串跟著封存
+- **Discord → GitHub** — 討論串裡的訊息(含附件)變成 issue 留言。圖片用 markdown 語法送出,GitHub 會自己抓下來快取,所以 Discord 的 CDN 連結過期之後圖還在
+- **GitHub → Discord** — issue 的新留言回到討論串。GitHub 編輯器貼的圖是原始 HTML,會被拆成 Discord 看得懂的形式
+- **狀態** — issue 關閉時討論串封存、公告改成「已完成」並附上耗時;重新開啟則反過來
+
+**討論串一律封存,不會刪除。** Gist 和 issue 留著紀錄,但刪掉討論串會連帶讓所有貼過的連結失效,而且沒有復原。封存不用成本,想繼續談在裡面發言就會自動解除。
 
 ## 跑起來
 

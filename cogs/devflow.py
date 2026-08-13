@@ -368,12 +368,63 @@ class DevFlow(commands.Cog):
             
             # Add the mapping between the original message and the new issue
             self._add_thread_mapping(str(interaction.message.id), created_issue.number, repo.full_name)
-            
+
+            # The thread may already exist — somebody pressed 我有問題 and the
+            # conversation started before anyone got round to opening an issue.
+            # Everything said in that window used to be dropped, because the
+            # sync listener has nothing to sync to until this mapping exists.
+            backfilled = await self._backfill_thread(interaction.message, repo, created_issue)
+
             assign_msg = f"並已嘗試將您 (`{github_username}`) 指派。" if github_username else ""
+            if backfilled:
+                assign_msg += f" 討論串裡先前的 {backfilled} 則訊息也補上去了。"
             await interaction.followup.send(f"✅ 成功在 GitHub 建立 Issue #{created_issue.number}！ {assign_msg}", ephemeral=True)
         except Exception as e:
             logger.error(f"Failed to create/assign GitHub Issue for {view.original_interaction.user}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ 建立或指派 GitHub Issue 時發生錯誤: {e}", ephemeral=True)
+
+    async def _backfill_thread(self, announcement: discord.Message, repo, issue) -> int:
+        """Copies anything already said in the thread onto the freshly made issue.
+
+        Posted as one comment rather than one per message: a dozen separate
+        comments would bury the issue, and the ordering is what matters here,
+        not who gets attributed on GitHub — the names are in the text.
+
+        Returns how many messages were carried over.
+        """
+        thread = getattr(announcement, "thread", None)
+        if thread is None:
+            return 0
+
+        try:
+            history = [message async for message in thread.history(limit=200, oldest_first=True)]
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not read thread %s for backfill: %s", thread.id, error)
+            return 0
+
+        lines = []
+        for message in history:
+            if message.author.bot or not (message.clean_content or message.attachments):
+                continue
+            lines.append(f"**{message.author.display_name}：** {message.clean_content}")
+            for attachment in message.attachments:
+                lines.append(f"- [{attachment.filename}]({attachment.url})")
+
+        if not lines:
+            return 0
+
+        body = (
+            "📜 **開 Issue 之前討論串裡已經說過的話**\n\n"
+            + "\n".join(lines)
+            + f"\n\n{store.SYNC_MARKER}"
+        )
+        try:
+            await self._run_sync(issue.create_comment, body[:65000])
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not backfill %s#%s: %s", repo.full_name, issue.number, error)
+            return 0
+        logger.info("backfilled %d messages onto %s#%s", len(lines), repo.full_name, issue.number)
+        return len(lines)
 
     async def handle_collaboration_request(self, interaction: Interaction, button: ui.Button, dev_task_view: DevTaskView, task_description: str):
         original_task_author = dev_task_view.original_interaction.user
@@ -590,7 +641,6 @@ class DevFlow(commands.Cog):
         # --- New GitHub Sync and Close Logic ---
         github_sync_success = False
         issue_closed_success = False
-        thread_deleted_success = False
         error_messages = []
 
         # Get the user's GitHub token to perform actions on their behalf
@@ -685,30 +735,36 @@ class DevFlow(commands.Cog):
         task_name_preview = f"{task_field.value[:30]}..." if task_field else "此任務"
         
         final_report = [f"🎉 任務「{task_name_preview}」已被標記為已完成！"]
-        will_delete_thread = thread_to_process and github_sync_success and issue_closed_success
+        # Archived, not deleted. The Gist and the issue hold the record, but a
+        # deleted thread also takes with it every link anyone ever pasted to it,
+        # and there is no undo — while an archive costs nothing and can be
+        # reopened by posting in it. Closing the issue from GitHub already
+        # behaved this way, so both routes now leave the same thing behind.
+        will_archive_thread = thread_to_process and github_sync_success and issue_closed_success
 
         if mapping_info and thread_to_process:
             issue_url = f"https://github.com/{repo_full_name}/issues/{issue_number}"
             if github_sync_success: final_report.append(f"✅ 對話紀錄已歸檔至 [GitHub Issue #{issue_number}]({issue_url})。")
             if issue_closed_success: final_report.append(f"✅ GitHub Issue #{issue_number} 已關閉。")
-            if will_delete_thread: final_report.append("✅ Discord 討論串即將刪除。")
-        
+            if will_archive_thread: final_report.append("✅ Discord 討論串即將封存（不會刪除，紀錄留著）。")
+
         if error_messages:
             final_report.extend(error_messages)
 
-        # --- Send the final report BEFORE deleting the thread ---
+        # --- Send the final report BEFORE archiving, because an archived thread
+        #     cannot be posted into ---
         await interaction.followup.send("\n".join(filter(None, final_report)), ephemeral=True)
 
-        # --- Delete Thread ---
-        if will_delete_thread:
+        # --- Archive Thread ---
+        if will_archive_thread:
             try:
-                await thread_to_process.delete()
+                await thread_to_process.edit(archived=True)
             except Exception as e:
-                logger.error(f"Failed to delete thread {thread_to_process.id}: {e}", exc_info=True)
+                logger.error(f"Failed to archive thread {thread_to_process.id}: {e}", exc_info=True)
                 try:
-                    await interaction.user.send(f"⚠️ 任務「{task_name_preview}」的討論串刪除失敗，請手動刪除。錯誤：{e}")
+                    await interaction.user.send(f"⚠️ 任務「{task_name_preview}」的討論串封存失敗，請手動封存。錯誤：{e}")
                 except discord.Forbidden:
-                    logger.error(f"Failed to send DM to user {interaction.user.id} about thread deletion failure.")
+                    logger.error(f"Failed to send DM to user {interaction.user.id} about thread archival failure.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

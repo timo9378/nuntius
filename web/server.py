@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import time
 
 import aiohttp
@@ -112,6 +113,39 @@ async def github_callback(request: web.Request) -> web.Response:
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: GitHub's own editor emits raw HTML when you paste a picture into a comment,
+#: rather than markdown. Discord renders neither, so the tag has to be taken
+#: apart here or the reader sees `<img width="467" … />` as literal text.
+_HTML_IMAGE = re.compile(r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"'][^>]*>", re.IGNORECASE)
+_MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
+
+
+def _readable_in_discord(body: str) -> tuple[str, str | None]:
+    """Rewrites a GitHub comment for a Discord embed.
+
+    Returns the text and, if there was one, the first image URL — which the
+    caller hangs off the embed so the picture itself shows rather than only its
+    address.
+
+    A private repository's attachments need a GitHub session to fetch, so
+    Discord cannot load them and simply omits the image. The link is left in the
+    text for exactly that case.
+    """
+    found: list[str] = []
+
+    def take_html(match: re.Match) -> str:
+        found.append(match.group(1))
+        return f"[🖼️ 圖片]({match.group(1)})"
+
+    def take_markdown(match: re.Match) -> str:
+        found.append(match.group(2))
+        return f"[🖼️ {match.group(1) or '圖片'}]({match.group(2)})"
+
+    body = _HTML_IMAGE.sub(take_html, body)
+    body = _MARKDOWN_IMAGE.sub(take_markdown, body)
+    return body, (found[0] if found else None)
+
+
 def _signature_matches(secret: str, body: bytes, header: str | None) -> bool:
     """Whether the delivery really came from GitHub.
 
@@ -189,11 +223,14 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
 
     import discord
 
+    text, image = _readable_in_discord(body)
     embed = discord.Embed(
-        description=body[:4000],
+        description=text[:4000],
         url=comment["html_url"],
         colour=0x2DA44E,
     )
+    if image:
+        embed.set_image(url=image)
     embed.set_author(
         name=f"{author} 在 GitHub 留言",
         url=comment["html_url"],
