@@ -1,0 +1,17 @@
+# Secrets never belong in an image layer. `env_file:` in docker-compose.yml
+# injects these at run time instead, which is also what makes the image safe to
+# push anywhere.
+.env
+.env.*
+!.env.example
+
+# Runtime state. Bind-mounted at run time; baking a copy in would mean a fresh
+# container silently starts from whatever was on disk at build time.
+data/
+
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+README.md

@@ -12,6 +12,14 @@ services:
     build: .
     container_name: nuntius
     restart: unless-stopped
+    # Matching the owner of ./data on the host. The image has its own non-root
+    # user, but a bind mount keeps the host's ownership and shadows whatever the
+    # image set up — so the container has to run as somebody who can write
+    # there. Doing it this way, rather than chowning ./data to the image's uid,
+    # keeps the mapping files readable and backup-able as your own user.
+    #
+    # Change this if you run as a different uid: `id -u`, `id -g`.
+    user: "1000:1000"
     env_file: [.env]
     environment:
       # Only reached when the socket proxy is running; harmless otherwise,
@@ -25,7 +33,7 @@ services:
       # Put a reverse proxy in front and give GitHub the public URL. This is not
       # HTTPS on its own, and GitHub will not deliver webhooks to plain HTTP on
       # a public host.
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8091:8080"
     networks: [nuntius-net]
 
   # ──────────────────────────────────────────────────────────────
