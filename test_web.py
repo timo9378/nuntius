@@ -101,7 +101,10 @@ class StubPosted:
 
 
 class StubCog:
-    """Only the two methods the webhook borrows from the real cog."""
+    """Only the pieces of the real cog the webhook borrows."""
+
+    def announce_channel_for(self, _repo=None):
+        return None
 
     def _update_embed_for_completion(self, embed):
         copy = embed.copy()

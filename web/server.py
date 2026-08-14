@@ -735,7 +735,7 @@ async def _handle_pull_request(request: web.Request, repo: str, payload: dict, a
             return
         bot = request.app["bot"]
         cog = bot.get_cog("DevFlow")
-        channel = getattr(cog, "dev_announce_channel", None) if cog else None
+        channel = cog.announce_channel_for(repo) if cog else None
         if channel is None:
             return
         await announce_issue(bot, channel, repo, {**pull, "kind": "pull"})
@@ -1146,7 +1146,7 @@ async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -
 
     bot = request.app["bot"]
     cog = bot.get_cog("DevFlow")
-    channel = getattr(cog, "dev_announce_channel", None) if cog else None
+    channel = cog.announce_channel_for(repo) if cog else None
     if channel is None:
         logger.warning("no announce channel configured; %s#%s gets no thread", repo, number)
         return

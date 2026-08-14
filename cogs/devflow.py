@@ -80,6 +80,8 @@ class DevFlow(commands.Cog):
         self.repo_name = os.getenv('GITHUB_REPO_NAME')
         self.dev_announce_channel_id_str = os.getenv('DEV_ANNOUNCE_CHANNEL_ID')
         self.dev_announce_channel = None
+        #: repo -> channel id, filled in once the bot has a channel cache.
+        self.announce_channels: dict[str, int] = {}
 
         logger.info(f"DevFlow cog init: GITHUB_OAUTH_CLIENT_ID_IS_SET: {bool(self.oauth_client_id)}")
         logger.info(f"DevFlow cog init: GITHUB_REPO_OWNER: '{self.repo_owner}'")
@@ -252,6 +254,45 @@ class DevFlow(commands.Cog):
             self._load_and_process_mappings() 
         return self.user_mappings.get(discord_id_str)
 
+    def announce_channel_for(self, repo: str | None = None):
+        """Where a repository's tasks get announced.
+
+        One instance can follow more than one repository, and mixing two
+        projects' backlogs into one forum makes both harder to read. So a
+        repository can be given a channel of its own; anything not named falls
+        back to `DEV_ANNOUNCE_CHANNEL_ID`, which is all a single-repo instance
+        ever needs.
+
+        A repository that *is* named but whose channel cannot be found gets
+        nothing rather than the fallback. Quietly filing one project's issues
+        into another project's forum is worse than not filing them: the mistake
+        is invisible, and undoing it means deleting posts by hand.
+        """
+        if repo:
+            channel_id = self.announce_channels.get(repo.lower())
+            if channel_id:
+                channel = self.bot.get_channel(channel_id)
+                if channel is None:
+                    logger.error(
+                        "DEV_ANNOUNCE_CHANNELS points %s at channel %s, which this bot "
+                        "cannot see. Nothing will be announced for it.",
+                        repo, channel_id,
+                    )
+                return channel
+        return self.dev_announce_channel
+
+    def _announce_channel_ids(self) -> dict[str, int]:
+        """`DEV_ANNOUNCE_CHANNELS=owner/one=123,owner/two=456`, parsed."""
+        mapping: dict[str, int] = {}
+        for pair in os.getenv("DEV_ANNOUNCE_CHANNELS", "").split(","):
+            repo, _, channel = pair.strip().partition("=")
+            repo, channel = repo.strip(), channel.strip()
+            if repo and channel.isdigit():
+                mapping[repo.lower()] = int(channel)
+            elif pair.strip():
+                logger.warning("DEV_ANNOUNCE_CHANNELS: cannot read %r, skipping it", pair.strip())
+        return mapping
+
     @commands.Cog.listener()
     async def on_ready(self):
         logger.info(f"DevFlow cog loaded and ready.")
@@ -264,6 +305,16 @@ class DevFlow(commands.Cog):
                 logger.info(f"DevFlow cog: Dev announce channel '{self.dev_announce_channel.name}' set.")
         else:
             logger.error(f"DevFlow cog: DEV_ANNOUNCE_CHANNEL_ID ('{self.dev_announce_channel_id_str}') is not set or invalid.")
+
+        # Resolved here rather than in `__init__`: the bot has no channel cache
+        # until it has connected, so a lookup before this point always fails.
+        self.announce_channels = self._announce_channel_ids()
+        for repo, channel_id in self.announce_channels.items():
+            channel = self.bot.get_channel(channel_id)
+            logger.info(
+                "%s announces in %s",
+                repo, f"#{channel.name}" if channel else f"{channel_id} — NOT FOUND",
+            )
 
     @app_commands.command(name="login", description="授權 Bot 代表您訪問 GitHub。")
     async def github_login(self, interaction: Interaction):
@@ -345,32 +396,32 @@ class DevFlow(commands.Cog):
     @app_commands.autocomplete(repo=repo_autocomplete)
     async def start_dev(self, interaction: Interaction, task: str, repo: str = None,
                         labels: str = None, milestone: str = None):
-        if not self.dev_announce_channel:
-            if self.dev_announce_channel_id_str and self.dev_announce_channel_id_str.isdigit():
-                channel_id = int(self.dev_announce_channel_id_str)
-                refetched_channel = self.bot.get_channel(channel_id)
-                if refetched_channel: self.dev_announce_channel = refetched_channel
-                else:
-                    logger.error(f"start-dev: Failed to re-fetch channel ID: {channel_id}.")
-                    await interaction.response.send_message(f"錯誤：無法找到開發公告頻道 ID: {channel_id}。", ephemeral=True)
-                    return
-            else:
-                logger.error(f"start-dev: DEV_ANNOUNCE_CHANNEL_ID not correctly set.")
-                await interaction.response.send_message("錯誤：開發公告頻道 ID 未設定。", ephemeral=True)
-                return
-        if not self.dev_announce_channel: 
-            await interaction.response.send_message("錯誤：開發公告頻道最終未能設定。", ephemeral=True)
+        # Which repository the task is for decides which channel it is announced
+        # in, so it has to be worked out before anything is sent.
+        target_repo_str = repo if repo else f"{self.repo_owner}/{self.repo_name}"
+        if not self.dev_announce_channel and self.dev_announce_channel_id_str and self.dev_announce_channel_id_str.isdigit():
+            self.dev_announce_channel = self.bot.get_channel(int(self.dev_announce_channel_id_str))
+        if not self.announce_channels:
+            self.announce_channels = self._announce_channel_ids()
+
+        channel = self.announce_channel_for(target_repo_str)
+        if channel is None:
+            logger.error("start-dev: no announce channel for %s", target_repo_str)
+            await interaction.response.send_message(
+                f"錯誤：找不到 `{target_repo_str}` 要公告的頻道。\n"
+                "檢查一下 `DEV_ANNOUNCE_CHANNELS` 和 `DEV_ANNOUNCE_CHANNEL_ID`。",
+                ephemeral=True,
+            )
             return
+
         await interaction.response.send_message("處理中...", ephemeral=True)
         embed = Embed(title="🚀 新開發任務已啟動！", color=discord.Color.blue())
         embed.add_field(name="🧑‍💻 開發者", value=interaction.user.display_name, inline=False)
         embed.add_field(name="📝 任務內容", value=task, inline=False)
-        
-        # Determine the target repo and display it
-        target_repo_str = repo if repo else f"{self.repo_owner}/{self.repo_name}"
+
         if target_repo_str:
              embed.add_field(name="🎯 目標儲存庫", value=f"`{target_repo_str}`", inline=False)
-        
+
         embed.add_field(name="📊 狀態", value="🟢 開發中", inline=False)
         embed.add_field(name="⏱️ 開始時間", value=f"<t:{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}:F>", inline=False)
         embed.set_footer(text=f"任務發起人 ID: {interaction.user.id}")
@@ -379,8 +430,8 @@ class DevFlow(commands.Cog):
                                    task_description=task, repo=repo,
                                    labels=labels, milestone=milestone)
         try:
-            await self.dev_announce_channel.send(embed=embed, view=view_buttons)
-            await interaction.followup.send(f"✅ 開發任務公告已發布於 {self.dev_announce_channel.mention}", ephemeral=True)
+            await channel.send(embed=embed, view=view_buttons)
+            await interaction.followup.send(f"✅ 開發任務公告已發布於 {channel.mention}", ephemeral=True)
         except Exception as e:
             logger.error(f"Error in start_dev sending message: {e}", exc_info=True)
             await interaction.followup.send(f"錯誤：發布公告時發生問題。", ephemeral=True)
@@ -978,8 +1029,11 @@ class DevFlow(commands.Cog):
             self.thread_issue_mappings.pop(existing, None)
             logger.info("dropped the mapping for thread %s; it no longer exists", existing)
 
-        if not self.dev_announce_channel:
-            await interaction.followup.send("❌ 公告頻道沒設定好。", ephemeral=True)
+        channel = self.announce_channel_for(repo_path)
+        if channel is None:
+            await interaction.followup.send(
+                f"❌ 找不到 `{repo_path}` 要公告的頻道，檢查 `DEV_ANNOUNCE_CHANNELS`。", ephemeral=True
+            )
             return
 
         # The same shape the webhook hands over, so both routes produce an
@@ -1006,7 +1060,7 @@ class DevFlow(commands.Cog):
         ]
 
         thread = await server.announce_issue(
-            self.bot, self.dev_announce_channel, repo_path, payload, history
+            self.bot, channel, repo_path, payload, history
         )
         if thread is None:
             await interaction.followup.send("❌ 建立討論串失敗，看一下 bot 的 log。", ephemeral=True)
@@ -1294,8 +1348,11 @@ class DevFlow(commands.Cog):
         if not token:
             await interaction.followup.send("❌ 沒有可用的 GitHub 憑證。", ephemeral=True)
             return
-        if not self.dev_announce_channel:
-            await interaction.followup.send("❌ 公告頻道沒設定好。", ephemeral=True)
+        channel = self.announce_channel_for(repo_path)
+        if channel is None:
+            await interaction.followup.send(
+                f"❌ 找不到 `{repo_path}` 要公告的頻道，檢查 `DEV_ANNOUNCE_CHANNELS`。", ephemeral=True
+            )
             return
 
         try:
@@ -1354,7 +1411,7 @@ class DevFlow(commands.Cog):
                     logger.warning("could not read comments on #%s: %s", issue.number, error)
 
             thread = await server.announce_issue(
-                self.bot, self.dev_announce_channel, repo_path, payload, history
+                self.bot, channel, repo_path, payload, history
             )
             if thread is None:
                 failed += 1
@@ -1547,28 +1604,55 @@ class DevFlow(commands.Cog):
             
     # --- `finish-dev` and its helper methods ---
 
+    def _announce_parents(self) -> list:
+        """Every channel tasks are announced in, whichever repository they are for.
+
+        `/close` has to work in a thread under any of them. Checking against the
+        one default channel means the command silently refuses in the threads of
+        every repository that was given a channel of its own.
+        """
+        channels = [self.dev_announce_channel] if self.dev_announce_channel else []
+        for channel_id in self.announce_channels.values():
+            channel = self.bot.get_channel(channel_id)
+            if channel is not None and channel not in channels:
+                channels.append(channel)
+        return channels
+
     async def _get_original_message(self, interaction: Interaction) -> discord.Message | None:
         """Finds the original task announcement message from a thread or reply."""
-        # Case 1: Command is used in a thread within the dev announce channel.
-        if self.dev_announce_channel and isinstance(interaction.channel, discord.Thread) and interaction.channel.parent_id == self.dev_announce_channel.id:
-            try:
-                return await self.dev_announce_channel.fetch_message(interaction.channel.id)
-            except discord.NotFound:
-                logger.warning(f"finish-dev: Original message for thread {interaction.channel.id} not found in dev_announce_channel.")
-            except Exception as e:
-                logger.error(f"Error fetching original message in finish_dev (thread context): {e}", exc_info=True)
+        parents = self._announce_parents()
+
+        # Case 1: Command is used in a thread under one of the announce channels.
+        if isinstance(interaction.channel, discord.Thread):
+            parent = next(
+                (c for c in parents if c.id == interaction.channel.parent_id), None
+            )
+            if parent is not None:
+                try:
+                    return await parent.fetch_message(interaction.channel.id)
+                except discord.NotFound:
+                    logger.warning(f"finish-dev: Original message for thread {interaction.channel.id} not found in #{parent.name}.")
+                except Exception as e:
+                    logger.error(f"Error fetching original message in finish_dev (thread context): {e}", exc_info=True)
 
         # Case 2: Command is a reply to the bot's announcement message.
         if interaction.message and interaction.message.reference and interaction.message.reference.message_id:
             try:
                 ref_msg_id = interaction.message.reference.message_id
-                # Try fetching from current channel, then dev_announce_channel if different.
+                # Try the current channel, then each announce channel.
                 try:
                     referenced_message = await interaction.channel.fetch_message(ref_msg_id)
                 except discord.NotFound:
-                    if self.dev_announce_channel and interaction.channel.id != self.dev_announce_channel.id:
-                        referenced_message = await self.dev_announce_channel.fetch_message(ref_msg_id)
-                    else:
+                    referenced_message = None
+                    for parent in parents:
+                        if parent.id == interaction.channel.id:
+                            continue
+                        try:
+                            referenced_message = await parent.fetch_message(ref_msg_id)
+                            break
+                        except discord.NotFound:
+                            continue
+                    if referenced_message is None:
                         raise
                 
                 # Validate if it's the correct message type.
