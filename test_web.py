@@ -18,6 +18,7 @@ os.environ["DATA_DIR"] = WORKDIR
 os.environ["GITHUB_WEBHOOK_SECRET"] = "test-secret"
 # Cross-references only become Discord links when there is a guild to link into.
 os.environ["DISCORD_GUILD_ID"] = "1000000000"
+os.environ["CI_CHANNEL_ID"] = "1537700084681154660"
 
 import aiohttp
 
@@ -31,6 +32,7 @@ import discord
 SENT: list[tuple[int, dict]] = []
 ARCHIVED: list[bool] = []
 EDITED: list[dict] = []
+RENAMED: list[str] = []
 
 
 def _announcement_embed() -> discord.Embed:
@@ -51,7 +53,15 @@ class StubMessage:
     async def edit(self, **changes):
         embed = changes.get("embed")
         status = next((f.value for f in embed.fields if f.name == "📊 狀態"), None)
-        EDITED.append({"status": status, "changes": set(changes)})
+        title = next((f.value for f in embed.fields if f.name == "📝 標題"), None)
+        EDITED.append({
+            "status": status,
+            "title": title,
+            "description": embed.description,
+            "changes": set(changes),
+        })
+        # The card the webhook reads back is the one it just wrote.
+        self.embeds = [embed]
 
 
 class StubParent:
@@ -66,13 +76,28 @@ class StubThread:
     def __init__(self, channel_id, announcement):
         self.id = channel_id
         self.parent = StubParent(announcement)
+        self.name = "#42 原本的標題"
 
     async def send(self, **kwargs):
         SENT.append((self.id, kwargs))
+        return StubPosted(self.id)
 
     async def edit(self, **kwargs):
         if "archived" in kwargs:
             ARCHIVED.append(kwargs["archived"])
+        if "name" in kwargs:
+            self.name = kwargs["name"]
+            RENAMED.append(kwargs["name"])
+
+
+class StubPosted:
+    """What `send` hands back, so callers that record the message can."""
+
+    _next = iter(range(9_000_001, 9_000_999))
+
+    def __init__(self, channel_id):
+        self.id = next(StubPosted._next)
+        self.channel_id = channel_id
 
 
 class StubCog:
@@ -93,9 +118,12 @@ class StubCog:
 class StubBot:
     def __init__(self):
         self.announcement = StubMessage()
+        self.threads = {}
 
     def get_channel(self, channel_id):
-        return StubThread(channel_id, self.announcement)
+        # One instance per id: a rename has to still be there on the next look,
+        # or the "already says that, do nothing" guards cannot be tested.
+        return self.threads.setdefault(channel_id, StubThread(channel_id, self.announcement))
 
     async def fetch_channel(self, channel_id):
         return self.get_channel(channel_id)
@@ -106,6 +134,11 @@ class StubBot:
 
 def signed(body: bytes) -> str:
     return "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+
+
+async def _answer(value):
+    """A ready-made result, for standing in where a coroutine is expected."""
+    return value
 
 
 def check(label: str, actual, expected) -> bool:
@@ -261,6 +294,7 @@ async def main() -> int:
                     "repository": {"full_name": "Limatura/tessera"},
                     "issue": {"number": 42},
                     "comment": {
+                        "id": 8001,
                         "body": "來自 GitHub 的留言",
                         "html_url": "https://github.com/Limatura/tessera/issues/42#issuecomment-1",
                         "user": {"login": "sao-coding", "avatar_url": "https://example.invalid/a.png"},
@@ -284,6 +318,7 @@ async def main() -> int:
                     "repository": {"full_name": "Limatura/tessera"},
                     "issue": {"number": 42},
                     "comment": {
+                        "id": 8002,
                         "body": f"這句是從 Discord 來的\n\n{store.SYNC_MARKER}",
                         "html_url": "https://github.com/Limatura/tessera/issues/42#issuecomment-2",
                         "user": {"login": "timo9378"},
@@ -307,6 +342,7 @@ async def main() -> int:
                     "repository": {"full_name": "Limatura/tessera"},
                     "issue": {"number": 42},
                     "comment": {
+                        "id": 8003,
                         "body": "我在 GitHub 上手打的",
                         "html_url": "https://github.com/Limatura/tessera/issues/42#issuecomment-3",
                         "user": {"login": "timo9378"},
@@ -329,6 +365,7 @@ async def main() -> int:
                     "repository": {"full_name": "Limatura/tessera"},
                     "issue": {"number": 42},
                     "comment": {
+                        "id": 8004,
                         "body": "回 https://github.com/Limatura/tessera/issues/42#issuecomment-555 這則",
                         "html_url": "https://github.com/Limatura/tessera/issues/42#issuecomment-4",
                         "user": {"login": "octocat"},
@@ -347,6 +384,194 @@ async def main() -> int:
             # A reply whose parent has been deleted must still be posted.
             results.append(check("找不到對象時不會整則丟掉",
                                  getattr(reference, "fail_if_not_exists", None), False))
+
+            print("\nissues edited —— 卡片和討論串名稱以前會永遠停在建立當下")
+
+            async def deliver(event, body):
+                raw = json.dumps(body).encode()
+                async with session.post(
+                    f"{base}/github/webhook",
+                    data=raw,
+                    headers={"X-GitHub-Event": event, "X-Hub-Signature-256": signed(raw)},
+                ) as response:
+                    return response.status
+
+            status = await deliver("issues", {
+                "action": "edited",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 42, "title": "改過的標題", "body": "改過的內文"},
+                "changes": {"title": {"from": "原本的標題"}},
+            })
+            results.append(check("標題編輯事件被接受", status, 200))
+            results.append(check("討論串跟著改名", RENAMED[-1:], ["#42 改過的標題"]))
+            results.append(check("卡片的標題欄也改了", EDITED[-1]["title"], "改過的標題"))
+
+            before = len(RENAMED)
+            await deliver("issues", {
+                "action": "edited",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 42, "title": "改過的標題", "body": "改過的內文"},
+                "changes": {"title": {"from": "原本的標題"}},
+            })
+            # The convergence guard: the echo finds the name already right.
+            results.append(check("名稱已經對了就不再改一次", len(RENAMED), before))
+
+            await deliver("issues", {
+                "action": "edited",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 42, "title": "改過的標題", "body": "全新的內文"},
+                "changes": {"body": {"from": "舊的"}},
+            })
+            results.append(check("內文編輯會重寫卡片", EDITED[-1]["description"], "全新的內文"))
+
+            print("\npull_request —— 標籤和負責人以前根本沒接上")
+            before = len(SENT)
+            results.append(check("PR 被指派的事件被接受", await deliver("pull_request", {
+                "action": "assigned",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42, "assignees": [{"login": "octocat"}]},
+                "assignee": {"login": "octocat"},
+            }), 200))
+            results.append(check("PR 的指派有通知討論串", len(SENT) - before, 1))
+
+            before = len(SENT)
+            await deliver("pull_request", {
+                "action": "review_requested",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42},
+                "requested_reviewer": {"login": "octocat"},
+            })
+            results.append(check("被請求 review 會說出來",
+                                 "被請求 review" in SENT[-1][1].get("content", ""), True))
+
+            before = len(SENT)
+            await deliver("pull_request", {
+                "action": "ready_for_review",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42},
+            })
+            results.append(check("草稿轉正式會說出來", len(SENT) - before, 1))
+
+            print("\npull_request_review —— PR 的 review 以前在 Discord 完全看不到")
+            await deliver("pull_request_review", {
+                "action": "submitted",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42, "user": {"login": "timo9378"}},
+                "review": {"state": "approved", "body": "", "html_url": "https://x.invalid/r1",
+                           "user": {"login": "octocat"}},
+            })
+            results.append(check("approve 有報出來", "通過了這個 PR" in SENT[-1][1]["content"], True))
+
+            before = len(SENT)
+            await deliver("pull_request_review", {
+                "action": "submitted",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42, "user": {"login": "timo9378"}},
+                "review": {"state": "commented", "body": "", "html_url": "https://x.invalid/r2",
+                           "user": {"login": "octocat"}},
+            })
+            # An empty `commented` review is just the envelope the inline
+            # comments arrived in; relaying it would double every review.
+            results.append(check("沒有內容的 comment review 不轉發", len(SENT) - before, 0))
+
+            print("\npull_request_review_comment —— GitHub 唯一有真 threading 的地方")
+            await deliver("pull_request_review_comment", {
+                "action": "created",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42},
+                "comment": {"id": 9100, "body": "這一行會爆", "path": "auth.py", "line": 12,
+                            "html_url": "https://x.invalid/c1", "user": {"login": "octocat"}},
+            })
+            first = SENT[-1][1]["embed"]
+            results.append(check("帶上檔名和行號", first.footer.text.endswith("auth.py:12"), True))
+            parent_message = store.message_for_comment("Limatura/tessera", 9100, kind="review")
+            results.append(check("記下來了,而且分得出是 review 留言", parent_message is not None, True))
+            # The id space is separate from issue comments'; asking for the
+            # wrong kind must not find it.
+            results.append(check("不會被當成一般 issue 留言",
+                                 store.message_for_comment("Limatura/tessera", 9100), None))
+
+            await deliver("pull_request_review_comment", {
+                "action": "created",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 42},
+                "comment": {"id": 9101, "body": "不會,那邊有擋", "path": "auth.py", "line": 12,
+                            "in_reply_to_id": 9100,
+                            "html_url": "https://x.invalid/c2", "user": {"login": "timo9378"}},
+            })
+            results.append(check("in_reply_to_id 變成真正的 Discord 回覆",
+                                 getattr(SENT[-1][1].get("reference"), "message_id", None),
+                                 parent_message))
+
+            print("\nworkflow_run —— 只報失敗")
+            before = len(SENT)
+            await deliver("workflow_run", {
+                "action": "completed",
+                "repository": {"full_name": "Limatura/tessera"},
+                "workflow_run": {"name": "CI", "conclusion": "success",
+                                 "html_url": "https://x.invalid/run1", "pull_requests": []},
+            })
+            results.append(check("成功的執行不吵人", len(SENT) - before, 0))
+
+            before = len(SENT)
+            await deliver("workflow_run", {
+                "action": "completed",
+                "repository": {"full_name": "Limatura/tessera"},
+                "workflow_run": {"name": "CI", "conclusion": "cancelled",
+                                 "html_url": "https://x.invalid/run2", "pull_requests": []},
+            })
+            results.append(check("取消的執行也不吵人", len(SENT) - before, 0))
+
+            # The lookup needs GitHub; the handler's own logic is what is under
+            # test, so the pull request is handed to it directly.
+            original = server._pull_for_run
+            server._pull_for_run = lambda repo, run: _answer(
+                {"number": 42, "user": {"login": "timo9378"}}
+            )
+            try:
+                await deliver("workflow_run", {
+                    "action": "completed",
+                    "repository": {"full_name": "Limatura/tessera"},
+                    "workflow_run": {"name": "build", "conclusion": "failure",
+                                     "html_url": "https://x.invalid/run3",
+                                     "pull_requests": [{"number": 42}]},
+                })
+            finally:
+                server._pull_for_run = original
+            channel, kwargs = SENT[-1]
+            content = kwargs.get("content", "")
+            results.append(check("送進 CI 頻道而不是討論串", channel, 1537700084681154660))
+            results.append(check("說是哪個 workflow", "**build** 失敗" in content, True))
+            results.append(check("點名發 PR 的人", "timo9378" in content, True))
+            results.append(check("附上執行的連結", "run3" in content, True))
+            results.append(check("連回 PR 的討論串", "/555000111" in content, True))
+
+            # No pull request behind it — a push straight to a branch. Still
+            # reported, just with nobody in particular to point at.
+            before = len(SENT)
+            server._pull_for_run = lambda repo, run: _answer(None)
+            try:
+                await deliver("workflow_run", {
+                    "action": "completed",
+                    "repository": {"full_name": "Limatura/tessera"},
+                    "workflow_run": {"name": "build", "conclusion": "failure",
+                                     "head_branch": "main",
+                                     "html_url": "https://x.invalid/run4", "pull_requests": []},
+                })
+            finally:
+                server._pull_for_run = original
+            results.append(check("沒有 PR 的失敗也會報", len(SENT) - before, 1))
+            results.append(check("改成指出是哪個分支", "`main`" in SENT[-1][1]["content"], True))
+
+            # A handler that throws must not answer 500: GitHub redelivers on
+            # one, and these handlers post to Discord before they finish, so a
+            # retry says everything twice instead of repairing anything.
+            before = len(SENT)
+            results.append(check("壞掉的 payload 仍然回 200", await deliver("issues", {
+                "action": "edited",
+                "repository": {"full_name": "Limatura/tessera"},
+            }), 200))
+            results.append(check("而且沒有貼出半截東西", len(SENT) - before, 0))
 
             print("\nissues closed / reopened")
             for action, expected_archived, label in (

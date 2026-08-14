@@ -107,12 +107,21 @@ def write_threads(data: dict) -> None:
 
 
 def remember_comment(
-    message_id: int, repo_full_name: str, issue_number: int, comment_id: int
+    message_id: int,
+    repo_full_name: str,
+    issue_number: int,
+    comment_id: int,
+    kind: str = "issue",
 ) -> None:
     """Records which GitHub comment a Discord message became.
 
     The issue number is stored alongside because PyGithub reaches a comment
     through its issue, not through the repository.
+
+    `kind` separates an ordinary issue comment from a pull request *review*
+    comment. They are different endpoints with their own id sequences, so an id
+    alone does not say which one it is — and reaching for a review comment
+    through `issue.get_comment` finds nothing.
     """
     with _lock:
         data = _read(COMMENT_MAPPINGS_FILE)
@@ -120,6 +129,7 @@ def remember_comment(
             "repo": repo_full_name,
             "issue_number": issue_number,
             "comment_id": comment_id,
+            "kind": kind,
         }
         if len(data) > COMMENT_MAPPING_LIMIT:
             # dicts keep insertion order, and ids only ever increase, so the
@@ -134,16 +144,24 @@ def comment_for_message(message_id: int) -> dict | None:
     return _read(COMMENT_MAPPINGS_FILE).get(str(message_id))
 
 
-def message_for_comment(repo_full_name: str, comment_id: int) -> int | None:
+def message_for_comment(
+    repo_full_name: str, comment_id: int, kind: str = "issue"
+) -> int | None:
     """The Discord message a GitHub comment was mirrored into.
 
     A linear scan rather than a second index: the file is capped at a couple of
     thousand rows, and a deletion is rare enough that a second copy of the data
     to keep in step would cost more than it saves.
+
+    Rows written before `kind` existed have none, and those are all issue
+    comments — that is the only thing the bot mirrored back then.
     """
     for message_id, record in _read(COMMENT_MAPPINGS_FILE).items():
-        if record.get("comment_id") == comment_id and record.get("repo") == repo_full_name:
-            return int(message_id)
+        if record.get("comment_id") != comment_id or record.get("repo") != repo_full_name:
+            continue
+        if record.get("kind", "issue") != kind:
+            continue
+        return int(message_id)
     return None
 
 

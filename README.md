@@ -28,6 +28,10 @@
 - **在 GitHub 開的新 issue** — 自動在公告頻道長出一張卡和一個討論串,不用手動 `/link`
 - **論壇頻道** — `DEV_ANNOUNCE_CHANNEL_ID` 指向論壇的話就用論壇的方式:一則貼文一張單,GitHub 標籤對應到論壇標籤(`enhancement` → `Feature` 這類名字對不上的有別名表)
 - **狀態** — issue 關閉時討論串封存、公告改成「已完成」並附上耗時;重新開啟則反過來
+- **標題和內文** — 雙向。在 GitHub 改標題,討論串跟著改名、卡片跟著改;把討論串改名,issue 的標題跟著改。內文改了卡片也重寫(含圖表和表格)
+- **PR 的 review** — approve 和「要求修改」會進討論串並點名發 PR 的人;程式碼上的行內 review 留言也會,附上檔名和行號。GitHub 唯一有真 threading 的地方就是這裡(`in_reply_to_id`),所以那些回覆到 Discord 是**原生回覆**,不用靠連結繞
+- **PR 的生命週期** — 草稿轉正式、轉回草稿、被請求 review(會點名)。PR 的標籤、負責人、里程碑也會更新卡片 —— 這些發的是 `pull_request` 事件而不是 `issues`,以前整條沒接上,所以 PR 的卡片建好之後就是死的
+- **CI** — **只報失敗**,而且點名發 PR 的人,附上執行的連結。綠燈不報:預期中的結果每次都講,只會訓練大家忽略這個頻道,而那正是紅燈需要的注意力。取消的執行也不報,那幾乎都是故意的
 - **標籤** — 雙向。GitHub 加減 label 會改論壇貼文的標籤,反過來也是
 - **里程碑** — 顯示在卡片上,GitHub 那邊改了會跟著更新
 - **互相連結** — 在 Discord 貼別的討論串連結,到 GitHub 變成 `#12` 引用(所以兩張單的時間軸都看得到);GitHub 的 `#12` 到 Discord 變成討論串連結
@@ -50,9 +54,20 @@ docker compose up -d
 需要一個能被 GitHub 連到的公開 HTTPS 網址,指向這個容器的 8080 埠。兩個地方會用到它:
 
 1. **GitHub OAuth App**(<https://github.com/settings/developers>)—— callback 設成 `https://你的網域/github/callback`
-2. **Repo 的 webhook** —— payload URL 設成 `https://你的網域/github/webhook`,content type 選 `application/json`,secret 填 `GITHUB_WEBHOOK_SECRET`,事件勾 **Issues** 和 **Issue comments**
+2. **Repo 的 webhook** —— payload URL 設成 `https://你的網域/github/webhook`,content type 選 `application/json`,secret 填 `GITHUB_WEBHOOK_SECRET`,事件勾這六個:
 
-沒設 webhook 的話 GitHub → Discord 那個方向就是不會動,而且不會有任何錯誤訊息 —— 只是安靜地不同步。
+   | 事件 | 沒勾的話 |
+   | --- | --- |
+   | Issues | GitHub → Discord 整個方向都不會動 |
+   | Issue comments | 留言不會回到討論串 |
+   | Pull requests | PR 不會有卡片,標籤和負責人也不會更新 |
+   | Pull request reviews | approve 和「要求修改」在 Discord 看不到 |
+   | Pull request review comments | 程式碼上的行內 review 看不到 |
+   | Workflow runs | CI 失敗不會通知 |
+
+   沒勾的那些不會有任何錯誤訊息 —— 只是安靜地不同步。
+
+完全沒設 webhook 的話,GitHub → Discord 整個方向都不會動。
 
 ## GitHub Projects（選用）
 

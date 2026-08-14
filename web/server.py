@@ -382,7 +382,7 @@ def _attachments(rendered: list[tuple[str, bytes]]) -> list:
 
 
 async def _post_to_thread(request: web.Request, thread_id: str, **kwargs):
-    """Sends into a Discord thread, using the bot already connected.
+    """Sends into a Discord thread — or any channel — using the connected bot.
 
     Returns the message, so callers that need to remember it can.
     """
@@ -414,6 +414,20 @@ async def github_webhook(request: web.Request) -> web.Response:
     payload = await request.json()
     repo = payload.get("repository", {}).get("full_name", "")
 
+    try:
+        await _dispatch(request, repo, event, payload)
+    except Exception as error:  # noqa: BLE001
+        # Answered as accepted even so, and deliberately. A 500 makes GitHub
+        # redeliver, and these handlers post to Discord *before* they finish —
+        # so a retry does not repair anything, it just says everything twice.
+        # The delivery arrived and was understood; the bug is ours to find in
+        # the log, not GitHub's to keep knocking about.
+        logger.error("%s/%s blew up: %s", event, payload.get("action"), error, exc_info=True)
+
+    return web.json_response({"message": "accepted"})
+
+
+async def _dispatch(request: web.Request, repo: str, event: str, payload: dict) -> None:
     action = payload.get("action")
     if event == "issue_comment" and action == "created":
         # GitHub reports a pull request's conversation comments as
@@ -433,10 +447,16 @@ async def github_webhook(request: web.Request) -> web.Response:
         await _handle_comment_edited(request, repo, payload)
     elif event == "issue_comment" and action == "deleted":
         await _handle_comment_deleted(request, repo, payload)
+    elif event == "issues" and action == "edited":
+        await _handle_issue_edited(request, repo, payload)
     elif event == "pull_request":
         await _handle_pull_request(request, repo, payload, action)
-
-    return web.json_response({"message": "accepted"})
+    elif event == "pull_request_review" and action == "submitted":
+        await _handle_review(request, repo, payload)
+    elif event == "pull_request_review_comment":
+        await _handle_review_comment(request, repo, payload, action)
+    elif event == "workflow_run" and action == "completed":
+        await _handle_workflow_run(request, repo, payload)
 
 
 #: The embed field milestones live in. A constant because two places have to
@@ -721,11 +741,53 @@ async def _handle_pull_request(request: web.Request, repo: str, payload: dict, a
         await announce_issue(bot, channel, repo, {**pull, "kind": "pull"})
         return
 
-    if action not in ("closed", "reopened"):
-        return
-
     thread_id = store.thread_for_issue(repo, number)
     if not thread_id:
+        return
+
+    # A pull request's labels, assignees and milestone arrive as `pull_request`
+    # events, never as `issues` ones — so without this routing the card gets
+    # built and then never updates, even though the handlers already exist.
+    # They read `payload["issue"]`, and a pull request is an issue here.
+    if action in ("labeled", "unlabeled"):
+        await _handle_labels(request, repo, {**payload, "issue": pull})
+        return
+    if action in ("assigned", "unassigned"):
+        await _handle_assignees(request, repo, {**payload, "issue": pull})
+        return
+    if action in ("milestoned", "demilestoned"):
+        await _handle_milestone(request, repo, {**payload, "issue": pull})
+        return
+    if action == "edited":
+        await _handle_issue_edited(request, repo, {**payload, "issue": pull})
+        return
+
+    if action == "review_requested":
+        # The same reasoning as being assigned: this is a request aimed at one
+        # person, not a detail about the pull request.
+        who = (payload.get("requested_reviewer") or {}).get("login")
+        team = (payload.get("requested_team") or {}).get("name")
+        if who:
+            await _post_to_thread(
+                request, thread_id, content=f"👀 {_name_or_mention(who)} 被請求 review 這個 PR。"
+            )
+        elif team:
+            await _post_to_thread(request, thread_id, content=f"👀 `{team}` 被請求 review 這個 PR。")
+        return
+
+    if action in ("ready_for_review", "converted_to_draft"):
+        await _post_to_thread(
+            request,
+            thread_id,
+            content=(
+                f"🟢 `{repo}#{number}` 準備好被 review 了。"
+                if action == "ready_for_review"
+                else f"📝 `{repo}#{number}` 改回草稿。"
+            ),
+        )
+        return
+
+    if action not in ("closed", "reopened"):
         return
 
     merged = bool(pull.get("merged"))
@@ -750,6 +812,318 @@ async def _handle_pull_request(request: web.Request, repo: str, payload: dict, a
         await thread.edit(archived=closed)
     except Exception as error:  # noqa: BLE001
         logger.warning("could not set archived=%s on thread %s: %s", closed, thread_id, error)
+
+
+def _discord_id_for(login: str) -> str | None:
+    """The Discord account behind a GitHub handle, where there is one."""
+    if not login:
+        return None
+    for discord_id, record in store.read_users().items():
+        if not discord_id.isdigit():
+            continue
+        if (record.get("github_username") or "").lower() == login.lower():
+            return discord_id
+    return None
+
+
+def _name_or_mention(login: str) -> str:
+    """Pings where the handle is known, names where it is not.
+
+    A mention only reaches someone who has run `/login`. Falling back to the
+    handle in backticks keeps the sentence true for everybody else rather than
+    leaving a dead `@`.
+    """
+    discord_id = _discord_id_for(login)
+    return f"<@{discord_id}>" if discord_id else f"`{login}`"
+
+
+async def _handle_issue_edited(request: web.Request, repo: str, payload: dict) -> None:
+    """Carries an edited title or body through to the card and the thread.
+
+    Without this the card keeps the text the issue had when it was filed, for
+    good — and an issue's body is usually the thing that gets rewritten as the
+    task becomes clearer. Two sides saying different things is the failure this
+    whole bot exists to prevent, so it should not be the bot doing it.
+    """
+    issue = payload["issue"]
+    changes = payload.get("changes") or {}
+    thread_id = store.thread_for_issue(repo, issue["number"])
+    if not thread_id:
+        return
+
+    bot = request.app["bot"]
+
+    if "title" in changes:
+        # The thread carries the title too, and a stale thread name is the more
+        # visible half — it is what people scroll past in the channel list.
+        thread = bot.get_channel(int(thread_id))
+        wanted = f"#{issue['number']} {issue['title']}"[:100]
+        if thread is not None and thread.name != wanted:
+            try:
+                await thread.edit(name=wanted)
+                logger.info("renamed thread %s to %r", thread_id, wanted)
+            except Exception as error:  # noqa: BLE001
+                logger.warning("could not rename thread %s: %s", thread_id, error)
+        await _update_card_field(request, repo, payload, "📝 標題", issue["title"][:1000])
+
+    if "body" not in changes:
+        return
+
+    card = await _card_for(bot, thread_id)
+    if card is None or not card.embeds:
+        return
+
+    text, rendered = await mermaid.diagrams(issue.get("body") or "")
+    text = tables.convert(text)
+    text, image = _readable_in_discord(text)
+    text = _link_github_syntax(text, repo)
+
+    embed = card.embeds[0].copy()
+    embed.description = text[:1500] or "*（沒有內文）*"
+    if image:
+        embed.set_image(url=image)
+
+    try:
+        # Attachments go wholesale, so a diagram added in the edit appears and
+        # one removed in the edit goes away.
+        await card.edit(embed=embed, attachments=_attachments(rendered))
+        logger.info("updated the card body for %s#%s", repo, issue["number"])
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not update the card for thread %s: %s", thread_id, error)
+
+
+async def _handle_review(request: web.Request, repo: str, payload: dict) -> None:
+    """A submitted pull request review.
+
+    Approving and requesting changes are both addressed *at* the author — one
+    unblocks them, the other asks for work — so both ping. A plain comment
+    review does not; it is usually just the envelope the inline comments came
+    in, and those arrive on their own.
+    """
+    review = payload["review"]
+    pull = payload["pull_request"]
+    thread_id = store.thread_for_issue(repo, pull["number"])
+    if not thread_id:
+        return
+
+    state = (review.get("state") or "").lower()
+    reviewer = review["user"]["login"]
+    author = (pull.get("user") or {}).get("login", "")
+    body = (review.get("body") or "").strip()
+
+    if state == "approved":
+        headline = f"✅ **{reviewer}** 通過了這個 PR"
+        ping = _name_or_mention(author) if author else ""
+    elif state == "changes_requested":
+        headline = f"🔴 **{reviewer}** 要求修改"
+        ping = _name_or_mention(author) if author else ""
+    else:
+        # `commented`, and anything GitHub adds later. Only worth relaying when
+        # it actually carries words.
+        if not body:
+            return
+        headline = f"💬 **{reviewer}** 留下了 review 意見"
+        ping = ""
+
+    import discord
+
+    embed = discord.Embed(
+        description=_link_github_syntax(tables.convert(body), repo)[:4000] if body else "",
+        url=review.get("html_url"),
+        colour=0x2DA44E if state == "approved" else 0xD1242F if state == "changes_requested" else 0x57606A,
+    )
+    embed.set_author(
+        name=f"{reviewer} 在 GitHub review",
+        url=review.get("html_url"),
+        icon_url=review["user"].get("avatar_url"),
+    )
+    embed.set_footer(text=f"{repo}#{pull['number']}")
+
+    await _post_to_thread(
+        request, thread_id, content=f"{headline}{' ' + ping if ping else ''}", embed=embed
+    )
+
+
+async def _handle_review_comment(request: web.Request, repo: str, payload: dict, action: str) -> None:
+    """An inline review comment, on a line of the diff.
+
+    The one place GitHub has real threading: a reply carries `in_reply_to_id`,
+    which maps straight onto a Discord reply with nothing invented in between.
+    """
+    import discord
+
+    comment = payload["comment"]
+    pull = payload["pull_request"]
+    number = pull["number"]
+    thread_id = store.thread_for_issue(repo, number)
+    if not thread_id:
+        return
+
+    message_id = store.message_for_comment(repo, comment["id"], kind="review")
+
+    if action == "deleted":
+        if message_id is None:
+            return
+        thread = request.app["bot"].get_channel(int(thread_id))
+        if thread is not None:
+            try:
+                await (await thread.fetch_message(message_id)).delete()
+            except Exception as error:  # noqa: BLE001
+                logger.warning("could not delete message %s: %s", message_id, error)
+        store.forget_message(message_id)
+        return
+
+    body = comment.get("body") or ""
+    text, rendered = await mermaid.diagrams(body)
+    text = tables.convert(text)
+    text, image = _readable_in_discord(text)
+    text = _link_github_syntax(text, repo)
+
+    # Which line is being talked about is most of the meaning of an inline
+    # comment; without it the reader has no idea what "this looks wrong" is about.
+    where = comment.get("path") or ""
+    line = comment.get("line") or comment.get("original_line")
+    if where and line:
+        where = f"{where}:{line}"
+
+    embed = discord.Embed(description=text[:4000], url=comment["html_url"], colour=0x8250DF)
+    embed.set_author(
+        name=f"{comment['user']['login']} 在 GitHub review 了程式碼",
+        url=comment["html_url"],
+        icon_url=comment["user"].get("avatar_url"),
+    )
+    embed.set_footer(text=f"{repo}#{number} · {where}" if where else f"{repo}#{number}")
+    if image:
+        embed.set_image(url=image)
+
+    if action == "edited":
+        if message_id is None:
+            return
+        thread = request.app["bot"].get_channel(int(thread_id))
+        if thread is None:
+            return
+        try:
+            message = await thread.fetch_message(message_id)
+            await message.edit(embed=embed, attachments=_attachments(rendered))
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not edit message %s: %s", message_id, error)
+        return
+
+    extra = {}
+    if rendered:
+        extra["files"] = _attachments(rendered)
+
+    parent = comment.get("in_reply_to_id")
+    if parent:
+        answering = store.message_for_comment(repo, int(parent), kind="review")
+        if answering is not None:
+            extra["reference"] = discord.MessageReference(
+                message_id=answering, channel_id=int(thread_id), fail_if_not_exists=False
+            )
+
+    posted = await _post_to_thread(request, thread_id, embed=embed, **extra)
+    if posted is not None:
+        store.remember_comment(posted.id, repo, number, comment["id"], kind="review")
+
+
+#: Conclusions worth waking somebody for.
+#:
+#: `cancelled` is left out because it is nearly always deliberate — somebody
+#: pushed again, or stopped the run — and reporting it turns a normal working
+#: rhythm into alarms.
+CI_FAILURES = {"failure", "timed_out", "action_required"}
+
+
+async def _pull_for_run(repo: str, run: dict) -> dict | None:
+    """The pull request a workflow run belongs to.
+
+    `pull_requests` in the payload is empty more often than the shape suggests
+    — notably for runs on forks — so the branch is the fallback. Fetched rather
+    than guessed because the run does not carry who opened the pull request,
+    and that is who needs telling.
+    """
+    token = os.getenv("GITHUB_BOT_TOKEN")
+    if not token:
+        return None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+    numbers = [p["number"] for p in run.get("pull_requests") or [] if p.get("number")]
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            if not numbers:
+                branch = run.get("head_branch")
+                if not branch:
+                    return None
+                owner = repo.split("/")[0]
+                async with session.get(
+                    f"{GITHUB_API}/repos/{repo}/pulls",
+                    params={"head": f"{owner}:{branch}", "state": "open"},
+                    headers=headers,
+                ) as response:
+                    found = await response.json()
+                if not isinstance(found, list) or not found:
+                    return None
+                return found[0]
+            async with session.get(
+                f"{GITHUB_API}/repos/{repo}/pulls/{numbers[0]}", headers=headers
+            ) as response:
+                pull = await response.json()
+        return pull if isinstance(pull, dict) and pull.get("number") else None
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not look up the pull request for a workflow run: %s", error)
+        return None
+
+
+async def _handle_workflow_run(request: web.Request, repo: str, payload: dict) -> None:
+    """Reports a failed CI run into the CI channel.
+
+    Failures only. A green run is the expected outcome, and saying so every
+    time trains people to scroll past the channel — which costs exactly the
+    attention the red ones need.
+
+    Its own channel rather than the pull request's thread, so that the feed is
+    complete in one place and can be muted as a unit. The person who opened the
+    pull request is pinged by name, and a mention reaches them wherever it is
+    written, so nothing is lost by keeping it out of the thread.
+    """
+    run = payload.get("workflow_run") or {}
+    if (run.get("conclusion") or "").lower() not in CI_FAILURES:
+        return
+
+    channel_id = os.getenv("CI_CHANNEL_ID", "")
+    if not channel_id.isdigit():
+        logger.info("CI_CHANNEL_ID is unset; a failed run goes unreported")
+        return
+
+    conclusion = (run.get("conclusion") or "").lower()
+    verb = {"timed_out": "逾時", "action_required": "需要處理"}.get(conclusion, "失敗")
+    name = run.get("name") or "CI"
+
+    pull = await _pull_for_run(repo, run)
+    if pull is None:
+        # A run with no pull request behind it — nearly always a push straight
+        # to the default branch. Still worth reporting, and arguably the most
+        # worth reporting; there is just nobody in particular to point at.
+        where = f"`{run.get('head_branch') or '?'}`"
+        who = ""
+    else:
+        number = pull["number"]
+        thread_id = store.thread_for_issue(repo, number)
+        # Linked into Discord where the conversation already is, so the channel
+        # is somewhere to act from rather than only somewhere to be told.
+        where = (
+            f"[{repo}#{number}](https://discord.com/channels/{GUILD_ID}/{thread_id})"
+            if thread_id and GUILD_ID
+            else f"`{repo}#{number}`"
+        )
+        author = (pull.get("user") or {}).get("login", "")
+        who = f" {_name_or_mention(author)}" if author else ""
+
+    await _post_to_thread(
+        request,
+        channel_id,
+        content=f"❌ **{name}** {verb} · {where}{who}\n<{run.get('html_url', '')}>",
+    )
 
 
 async def _handle_issue_opened(request: web.Request, repo: str, payload: dict) -> None:

@@ -553,21 +553,52 @@ class DevFlow(commands.Cog):
             logger.warning("cannot read %s#%s: %s", mapping["repo"], mapping["issue_number"], error)
             return None
 
+    #: The `#12 ` a mirrored thread's name starts with.
+    #:
+    #: Stripped before the rest is read as a title, so renaming the thread and
+    #: leaving the number on the front does not push "#12 修好登入" into the
+    #: issue's own title.
+    _THREAD_NUMBER = re.compile(r"^#\d+\s*")
+
+    async def _title_from_thread(self, thread, issue) -> None:
+        """Carries a renamed thread through to the issue's title.
+
+        The other direction of the webhook's `issues.edited`. Settles after one
+        hop the same way everything else here does: the echo arrives, finds the
+        title already says what it wants, and stops.
+        """
+        wanted = self._THREAD_NUMBER.sub("", thread.name or "").strip()
+        if not wanted or wanted == (issue.title or "").strip():
+            return
+        try:
+            await self._run_sync(issue.edit, title=wanted)
+            logger.info("title of #%s -> %r", issue.number, wanted)
+        except GithubException as error:
+            logger.warning("could not retitle #%s: %s", issue.number, error)
+
     @commands.Cog.listener()
     async def on_raw_thread_update(self, payload):
-        """Mirrors a forum post's tags back onto the issue's labels.
+        """Mirrors a renamed thread onto the issue, and a forum post's tags onto
+        its labels.
 
-        The other half of the label sync. Both directions settle after one hop
-        because each side checks whether the change it is about to make has
-        already been made — see the webhook's label handler for why that is the
-        guard rather than remembering what we just did.
+        Both directions settle after one hop because each side checks whether
+        the change it is about to make has already been made — see the webhook's
+        label handler for why that is the guard rather than remembering what we
+        just did.
         """
         thread = self.bot.get_channel(payload.thread_id)
-        if thread is None or not isinstance(getattr(thread, "parent", None), discord.ForumChannel):
+        if thread is None:
             return
 
         issue = await self._github_issue_for_thread_id(payload.thread_id)
         if issue is None:
+            return
+
+        # Renaming works in any channel shape. The tag half below cannot: only
+        # a forum post has tags to mirror.
+        await self._title_from_thread(thread, issue)
+
+        if not isinstance(getattr(thread, "parent", None), discord.ForumChannel):
             return
 
         # Tag name -> GitHub label, via the alias table read backwards. A tag
@@ -1795,7 +1826,11 @@ class DevFlow(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Listener to sync messages from Discord threads to GitHub issues."""
-        if message.author == self.bot.user or not isinstance(message.channel, discord.Thread):
+        # Every bot, not just this one. Another bot posting in a dev thread —
+        # a CI reporter, a reminder, anything added later — would otherwise be
+        # relayed onto the issue as if a person had said it, and a pair of bots
+        # each mirroring the other is how a thread fills up overnight.
+        if message.author.bot or not isinstance(message.channel, discord.Thread):
             return
 
         # The thread's ID is the original message's ID that started the thread.
