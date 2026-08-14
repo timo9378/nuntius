@@ -9,6 +9,7 @@ No new dependency: `aiohttp` is already what discord.py speaks HTTP with.
 
 import hashlib
 import hmac
+import io
 import logging
 import os
 import re
@@ -17,6 +18,7 @@ import time
 import aiohttp
 from aiohttp import web
 
+import mermaid
 import store
 
 logger = logging.getLogger(__name__)
@@ -185,7 +187,19 @@ _ALREADY_LINKED = re.compile(r"\]\([^)]*\)|<https?://[^>]*>|https?://\S+")
 _ISSUE_REF = re.compile(r"(?<![\w#])#(\d+)\b")
 
 #: A full issue or pull request URL.
-_ISSUE_URL = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)\b")
+#:
+#: Held off a comment permalink, which `_COMMENT_URL` below handles as a whole.
+#: Without the lookahead this matches the issue part and leaves the fragment
+#: stranded, so a pasted permalink became a thread link with a naked
+#: `#issuecomment-2891…` trailing it.
+_ISSUE_URL = re.compile(
+    r"https?://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)\b(?!#issuecomment-)"
+)
+
+#: A permalink to one particular comment.
+_COMMENT_URL = re.compile(
+    r"https?://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)#issuecomment-(\d+)"
+)
 
 
 def _point_at_threads(body: str, repo: str) -> str:
@@ -209,9 +223,42 @@ def _point_at_threads(body: str, repo: str) -> str:
             return f"[{other}#{number}](https://discord.com/channels/{GUILD_ID}/{thread})"
         return match.group(0)
 
+    def by_comment(match: re.Match) -> str:
+        """A permalink lands on the message itself, not merely on the thread."""
+        other, number, comment_id = match.group(1), int(match.group(2)), int(match.group(3))
+        thread = store.thread_for_issue(other, number)
+        message_id = store.message_for_comment(other, comment_id)
+        if thread and message_id:
+            return (
+                f"[{other}#{number} 的留言]"
+                f"(https://discord.com/channels/{GUILD_ID}/{thread}/{message_id})"
+            )
+        return match.group(0)
+
     if GUILD_ID:
+        # Permalinks first: the issue pattern would otherwise eat their prefix.
+        body = _COMMENT_URL.sub(by_comment, body)
         body = _ISSUE_URL.sub(by_url, body)
     return _ISSUE_REF.sub(by_number, body)
+
+
+def _replying_to(repo: str, body: str) -> int | None:
+    """The Discord message a GitHub comment is answering, if it says which.
+
+    GitHub's issue comments have no threading — only a pull request's *review*
+    comments carry an `in_reply_to_id`. So the only thing that can be read as a
+    reply is a permalink to another comment, which is what this bot writes when
+    it carries a Discord reply the other way, and what GitHub's own "Copy link"
+    gives a person.
+
+    The "Quote reply" button is deliberately not handled: it copies the text of
+    the comment and nothing that identifies it, so matching it back would mean
+    guessing from the prose. A wrong reply arrow is worse than none.
+    """
+    match = _COMMENT_URL.search(body)
+    if match is None or match.group(1).lower() != repo.lower():
+        return None
+    return store.message_for_comment(repo, int(match.group(3)))
 
 
 def _link_github_syntax(body: str, repo: str) -> str:
@@ -300,6 +347,18 @@ def _signature_matches(secret: str, body: bytes, header: str | None) -> bool:
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header)
+
+
+def _attachments(rendered: list[tuple[str, bytes]]) -> list:
+    """Rendered diagrams as Discord uploads.
+
+    Uploaded rather than linked. Pointing an embed at the renderer's URL would
+    put a host only this network can see in front of Discord's image proxy, and
+    would make every old diagram go blank the day that container is retired.
+    """
+    import discord
+
+    return [discord.File(io.BytesIO(data), filename=name) for name, data in rendered]
 
 
 async def _post_to_thread(request: web.Request, thread_id: str, **kwargs):
@@ -572,7 +631,8 @@ async def _handle_comment_edited(request: web.Request, repo: str, payload: dict)
     if thread is None:
         return
 
-    text, image = _readable_in_discord(body)
+    text, rendered = await mermaid.diagrams(body)
+    text, image = _readable_in_discord(text)
     text = _link_github_syntax(text, repo)
     embed = discord.Embed(
         description=text[:4000],
@@ -590,7 +650,10 @@ async def _handle_comment_edited(request: web.Request, repo: str, payload: dict)
 
     try:
         message = await thread.fetch_message(message_id)
-        await message.edit(embed=embed)
+        # Attachments are replaced wholesale, which is what makes editing a
+        # comment on GitHub the way to redraw a diagram that predates this — and
+        # the only way, since nothing goes back over old messages.
+        await message.edit(embed=embed, attachments=_attachments(rendered))
         logger.info("updated the Discord copy of %s comment %s", repo, comment["id"])
     except Exception as error:  # noqa: BLE001
         logger.warning("could not edit message %s: %s", message_id, error)
@@ -715,7 +778,8 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     author = issue.get("user", {}).get("login", "unknown")
 
     is_pull = issue.get("kind") == "pull"
-    text, image = _readable_in_discord(body)
+    text, rendered = await mermaid.diagrams(body)
+    text, image = _readable_in_discord(text)
     text = _link_github_syntax(text, repo)
     embed = discord.Embed(
         title="🔀 GitHub 上開了一個 PR" if is_pull else "🐙 GitHub 上開了一張單",
@@ -762,10 +826,12 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
                 named = os.getenv("DEFAULT_FORUM_TAG", "").lower()
                 by_name = {tag.name.lower(): tag for tag in channel.available_tags}
                 tags = [by_name.get(named) or channel.available_tags[0]]
-            created = await channel.create_thread(name=thread_name, embed=embed, applied_tags=tags)
+            created = await channel.create_thread(
+                name=thread_name, embed=embed, applied_tags=tags, files=_attachments(rendered)
+            )
             thread = created.thread
         else:
-            announcement = await channel.send(embed=embed)
+            announcement = await channel.send(embed=embed, files=_attachments(rendered))
             thread = await announcement.create_thread(name=thread_name, auto_archive_duration=10080)
     except Exception as error:  # noqa: BLE001
         logger.warning("could not announce %s#%s: %s", repo, number, error)
@@ -785,14 +851,15 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     # thread that starts empty makes you go and read GitHub anyway, which
     # defeats the point of linking it.
     for comment in history or []:
-        text, image = _readable_in_discord(comment.get("body") or "")
-        text = _link_github_syntax(text, repo)
-        past = discord.Embed(description=text[:4000] or "*（空留言）*", colour=0x57606A)
+        said, drawn = await mermaid.diagrams(comment.get("body") or "")
+        said, picture = _readable_in_discord(said)
+        said = _link_github_syntax(said, repo)
+        past = discord.Embed(description=said[:4000] or "*（空留言）*", colour=0x57606A)
         past.set_author(name=f"{comment.get('author', 'unknown')} · 既有留言")
-        if image:
-            past.set_image(url=image)
+        if picture:
+            past.set_image(url=picture)
         try:
-            await thread.send(embed=past)
+            await thread.send(embed=past, files=_attachments(drawn))
         except Exception as error:  # noqa: BLE001
             logger.warning("could not replay a comment into thread %s: %s", thread.id, error)
             break
@@ -825,7 +892,8 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
 
     import discord
 
-    text, image = _readable_in_discord(body)
+    text, rendered = await mermaid.diagrams(body)
+    text, image = _readable_in_discord(text)
     text = _link_github_syntax(text, repo)
     embed = discord.Embed(
         description=text[:4000],
@@ -840,7 +908,24 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
         icon_url=comment["user"].get("avatar_url"),
     )
     embed.set_footer(text=f"{repo}#{issue_number}")
-    posted = await _post_to_thread(request, thread_id, embed=embed)
+
+    extra = {}
+    if rendered:
+        extra["files"] = _attachments(rendered)
+
+    # A comment that links to another one is answering it, so say so with a real
+    # Discord reply rather than leaving the reader to follow the URL.
+    answering = _replying_to(repo, body)
+    if answering is not None:
+        extra["reference"] = discord.MessageReference(
+            message_id=answering,
+            channel_id=int(thread_id),
+            # The message may have been deleted since. A reply that cannot find
+            # its parent should still be posted, not dropped.
+            fail_if_not_exists=False,
+        )
+
+    posted = await _post_to_thread(request, thread_id, embed=embed, **extra)
 
     # So that reacting to this message in Discord lands on the GitHub comment it
     # came from. Only messages going the *other* way were recorded before, which

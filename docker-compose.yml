@@ -25,6 +25,15 @@ services:
       # Only reached when the socket proxy is running; harmless otherwise,
       # because the Docker cog does not load without WATCH_CONTAINER.
       - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      # The mermaid renderer below. Unset this and ```mermaid fences arrive in
+      # Discord as source, which is what happened before the renderer existed.
+      - MERMAID_URL=http://mermaid:3000
+    depends_on:
+      mermaid:
+        # Not required: a renderer that is not up yet only means a diagram
+        # arrives as source, which is the documented fallback. Waiting keeps the
+        # first few minutes after a deploy from looking like a regression.
+        condition: service_healthy
     volumes:
       # The two JSON mapping files. Losing this is losing the link between every
       # Discord thread and its GitHub issue.
@@ -34,7 +43,48 @@ services:
       # HTTPS on its own, and GitHub will not deliver webhooks to plain HTTP on
       # a public host.
       - "127.0.0.1:8091:8080"
-    networks: [nuntius-net]
+    networks: [nuntius-net, mermaid-net]
+
+  # ──────────────────────────────────────────────────────────────
+  # Mermaid rendering.
+  #
+  # Discord cannot render a ```mermaid fence and never will, so diagrams have to
+  # arrive as pictures. Drawing one means running mermaid.js, which means a
+  # browser — hence a whole container for what looks like a formatting concern.
+  #
+  # Self-hosted rather than the public mermaid.ink or kroki.io because the
+  # diagrams in a private repository *are* its architecture, and pointing this
+  # at a public renderer hands over every one of them.
+  # ──────────────────────────────────────────────────────────────
+  mermaid:
+    image: ghcr.io/jihchi/mermaid.ink:latest
+    container_name: nuntius-mermaid
+    restart: unless-stopped
+    environment:
+      # Chromium's own sandbox needs unprivileged user namespaces, which Ubuntu
+      # 23.10 and later deny through AppArmor. Without this the browser aborts
+      # on start-up with "No usable sandbox!" and the container never listens.
+      # The image reads CI to pass --no-sandbox.
+      #
+      # What replaces that sandbox is below: this container holds no secrets, is
+      # on a network with no route out, and cannot gain privileges. It is also
+      # not published — only nuntius can reach it.
+      - CI=1
+    # Chromium maps its shared memory here, and Docker's 64 MB default is where
+    # renders begin failing intermittently rather than outright.
+    shm_size: 256m
+    security_opt:
+      - no-new-privileges:true
+    # Rendering a trivial diagram, because the port answers several seconds
+    # before the browser behind it can actually draw anything. `docker compose
+    # ps` then tells you whether diagrams will work, rather than only whether a
+    # process is alive.
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:3000/img/Zmxvd2NoYXJ0IExSCiAgQSAtLT4gQg==?type=png"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+    networks: [mermaid-net]
 
   # ──────────────────────────────────────────────────────────────
   # Docker access, when the Docker cog is in use.
@@ -67,3 +117,11 @@ services:
 networks:
   nuntius-net:
     driver: bridge
+
+  # No route off the host. The renderer needs nothing from the internet — the
+  # mermaid library is baked into the image — and a browser engine parsing text
+  # that anyone with repository access can write is the one thing here worth
+  # penning in.
+  mermaid-net:
+    driver: bridge
+    internal: true

@@ -734,7 +734,83 @@ class DevFlow(commands.Cog):
         except GithubException as error:
             logger.warning("could not remove reaction %s: %s", content, error)
 
-    async def _render_for_github(self, message: discord.Message) -> str:
+    #: How much of the message being answered to quote back.
+    #:
+    #: A line, not the whole thing. The point is to say which remark is being
+    #: answered; the rest is one click away, and a full copy of a long comment
+    #: pushes the actual reply below the fold.
+    QUOTE_LIMIT = 200
+
+    async def _quoted_reply(self, message: discord.Message) -> str:
+        """The blockquote that stands in for the reply GitHub does not have.
+
+        GitHub's issue comments have no threading whatsoever — only a pull
+        request's *review* comments carry an `in_reply_to_id`. So a Discord
+        reply becomes what a person would write by hand: the line being
+        answered, quoted, above the answer.
+
+        Where the message being replied to was itself synced, the quote links to
+        the comment it became. That link is also what carries the reply *back* —
+        `web.server._replying_to` reads it and turns the mirrored message into a
+        real Discord reply, so answering on either side arrives as an answer on
+        the other.
+        """
+        reference = message.reference
+        if message.type is not discord.MessageType.reply or reference is None:
+            return ""
+        if reference.message_id is None:
+            return ""
+
+        # Usually already in hand; fetched only when Discord did not send it
+        # along, and not worth failing the whole sync over.
+        original = reference.resolved
+        if not isinstance(original, discord.Message):
+            try:
+                original = await message.channel.fetch_message(reference.message_id)
+            except (discord.HTTPException, discord.NotFound):
+                original = None
+
+        excerpt = ""
+        who = "先前的留言"
+        if original is not None:
+            embed = original.embeds[0] if original.embeds else None
+            if original.author == self.bot.user and embed is not None:
+                # One of ours, carrying somebody's GitHub comment. The author is
+                # in the embed's byline — "<login> 在 GitHub 留言" — and a login
+                # never contains a space.
+                byline = (embed.author.name or "").split()
+                who = f"@{byline[0]}" if byline else "GitHub"
+                excerpt = embed.description or ""
+            else:
+                data = await self._get_user_github_data(str(original.author.id))
+                handle = (data or {}).get("github_username")
+                who = f"@{handle}" if handle else original.author.display_name
+                excerpt = original.clean_content or ""
+
+        excerpt = " ".join(excerpt.split())
+        if len(excerpt) > self.QUOTE_LIMIT:
+            excerpt = excerpt[: self.QUOTE_LIMIT].rstrip() + "…"
+
+        # A display name is arbitrary text and can carry brackets, which would
+        # otherwise break out of the link below.
+        who = who.replace("[", "\\[").replace("]", "\\]")
+
+        recorded = store.comment_for_message(reference.message_id)
+        if recorded:
+            link = (
+                f"https://github.com/{recorded['repo']}/issues/"
+                f"{recorded['issue_number']}#issuecomment-{recorded['comment_id']}"
+            )
+            header = f"> **[{who}]({link})** 說："
+        else:
+            # Never synced, or synced before this bot started recording. Still
+            # worth quoting: the words are what identify the remark, the link
+            # only makes it clickable.
+            header = f"> **{who}** 說："
+
+        return f"{header}\n> {excerpt}\n\n" if excerpt else f"{header}\n\n"
+
+    async def _render_for_github(self, message: discord.Message, quote: bool = True) -> str:
         """A Discord message as it should read on GitHub.
 
         `clean_content` turns `<@123>` into the person's Discord nickname, which
@@ -765,7 +841,8 @@ class DevFlow(commands.Cog):
             else:
                 content = content.replace(f"<#{channel.id}>", f"#{channel.name}")
 
-        return _DISCORD_LINK.sub(lambda m: _thread_url_as_reference(m, message), content)
+        content = _DISCORD_LINK.sub(lambda m: _thread_url_as_reference(m, message), content)
+        return (await self._quoted_reply(message) if quote else "") + content
 
     async def _thread_exists(self, thread_id: str) -> bool:
         """Whether a recorded thread is still there.
@@ -1340,7 +1417,11 @@ class DevFlow(commands.Cog):
         for message in history:
             if message.author.bot or not (message.clean_content or message.attachments):
                 continue
-            lines.append(f"**{message.author.display_name}：** {await self._render_for_github(message)}")
+            # Without `quote`: each line here already opens with a speaker, and
+            # a blockquote started mid-line is not a blockquote at all. The
+            # ordering of the backfill is what conveys who answered whom.
+            rendered = await self._render_for_github(message, quote=False)
+            lines.append(f"**{message.author.display_name}：** {rendered}")
             for attachment in message.attachments:
                 lines.append(f"- [{attachment.filename}]({attachment.url})")
 

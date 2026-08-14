@@ -16,9 +16,12 @@ import tempfile
 WORKDIR = tempfile.mkdtemp()
 os.environ["DATA_DIR"] = WORKDIR
 os.environ["GITHUB_WEBHOOK_SECRET"] = "test-secret"
+# Cross-references only become Discord links when there is a guild to link into.
+os.environ["DISCORD_GUILD_ID"] = "1000000000"
 
 import aiohttp
 
+import mermaid
 import store
 from web import server
 
@@ -120,6 +123,52 @@ async def main() -> int:
     results.append(check("字串形式也找得到", store.thread_for_issue("Limatura/tessera", "42"), "555000111"))
     results.append(check("別的 repo 的 #42 不會誤中", store.thread_for_issue("other/repo", 42), None))
     results.append(check("不存在的 issue 回 None", store.thread_for_issue("Limatura/tessera", 99), None))
+
+    print("\nmermaid.extract —— 把圖表從留言裡挑出來")
+    _, found = mermaid.extract("前言\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n後記")
+    results.append(check("抓到 fence 裡的內容", found, ["flowchart LR\n  A --> B"]))
+    results.append(check("一則留言裡的兩張都抓到",
+                         mermaid.extract("```mermaid\nA\n```\n中間\n```mermaid\nB\n```")[1], ["A", "B"]))
+    results.append(check("別的語言的 fence 不碰", mermaid.extract("```python\nx = 1\n```")[1], []))
+    # An unterminated fence would otherwise swallow the rest of the comment.
+    results.append(check("沒有收尾的 fence 留在原地", mermaid.extract("```mermaid\nA\n忘了收尾")[1], []))
+    results.append(check("波浪號也是 fence", mermaid.extract("~~~mermaid\nA\n~~~")[1], ["A"]))
+    results.append(check("語言名稱不分大小寫", mermaid.extract("```Mermaid\nA\n```")[1], ["A"]))
+
+    print("\nmermaid.diagrams —— 渲染不成就退回原始碼")
+    os.environ.pop("MERMAID_URL", None)
+    text, files = await mermaid.diagrams("看圖\n\n```mermaid\nflowchart LR\n  A --> B\n```")
+    results.append(check("沒設定 MERMAID_URL 時沒有附件", files, []))
+    results.append(check("圖表原封不動留著", "```mermaid\nflowchart LR\n  A --> B\n```" in text, True))
+    # Nothing listens on port 1. The point is that an unreachable renderer
+    # degrades to the old behaviour instead of losing the diagram.
+    os.environ["MERMAID_URL"] = "http://127.0.0.1:1"
+    text, files = await mermaid.diagrams("```mermaid\nflowchart LR\n  A --> B\n```")
+    results.append(check("渲染器連不上時沒有附件", files, []))
+    results.append(check("渲染器連不上時退回原始碼", text.strip().startswith("```mermaid"), True))
+    os.environ.pop("MERMAID_URL", None)
+
+    print("\n留言連結 —— 回覆的兩個方向靠它接起來")
+    store.remember_comment(777000, "Limatura/tessera", 42, 555)
+    results.append(check(
+        "permalink 找得回 Discord 訊息",
+        server._replying_to("Limatura/tessera", "回 https://github.com/Limatura/tessera/issues/42#issuecomment-555"),
+        777000,
+    ))
+    results.append(check(
+        "別的 repo 的 permalink 不認",
+        server._replying_to("Limatura/tessera", "https://github.com/other/repo/issues/42#issuecomment-555"),
+        None,
+    ))
+    results.append(check("沒有連結就不是回覆",
+                         server._replying_to("Limatura/tessera", "一般留言"), None))
+    # The regression: `_ISSUE_URL` used to match the issue part of a permalink
+    # and leave `#issuecomment-555` stranded after the rewritten link.
+    rewritten = server._point_at_threads(
+        "看 https://github.com/Limatura/tessera/issues/42#issuecomment-555", "Limatura/tessera"
+    )
+    results.append(check("permalink 指到那一則訊息", "/555000111/777000" in rewritten, True))
+    results.append(check("permalink 沒有被切成兩半", "#issuecomment-" in rewritten, False))
 
     runner = await server.start(StubBot(), "127.0.0.1", 18099)
     base = "http://127.0.0.1:18099"
@@ -227,6 +276,33 @@ async def main() -> int:
             ) as response:
                 results.append(check("同一個帳號手打的留言仍然會同步", response.status, 200))
             results.append(check("討論串收到它", len(SENT), 2))
+
+            # GitHub has no reply of its own, so a permalink is what carries one.
+            # 777000 was recorded above as the Discord copy of comment 555.
+            answering = json.dumps(
+                {
+                    "action": "created",
+                    "repository": {"full_name": "Limatura/tessera"},
+                    "issue": {"number": 42},
+                    "comment": {
+                        "body": "回 https://github.com/Limatura/tessera/issues/42#issuecomment-555 這則",
+                        "html_url": "https://github.com/Limatura/tessera/issues/42#issuecomment-4",
+                        "user": {"login": "octocat"},
+                    },
+                }
+            ).encode()
+            async with session.post(
+                f"{base}/github/webhook",
+                data=answering,
+                headers={"X-GitHub-Event": "issue_comment", "X-Hub-Signature-256": signed(answering)},
+            ) as response:
+                results.append(check("帶留言連結的留言被接受", response.status, 200))
+            reference = SENT[-1][1].get("reference")
+            results.append(check("送出時帶著回覆對象",
+                                 getattr(reference, "message_id", None), 777000))
+            # A reply whose parent has been deleted must still be posted.
+            results.append(check("找不到對象時不會整則丟掉",
+                                 getattr(reference, "fail_if_not_exists", None), False))
 
             print("\nissues closed / reopened")
             for action, expected_archived, label in (
