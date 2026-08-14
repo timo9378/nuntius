@@ -20,6 +20,7 @@ from aiohttp import web
 
 import mermaid
 import store
+import tables
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,21 @@ TAG_ALIASES = {
 #: URL ends in a UUID, and a UUID's last group is twelve hex characters — which
 #: is indistinguishable from an abbreviated commit SHA. Left unprotected, the
 #: commit pass rewrites the middle of the image URL and the picture 404s.
-_ALREADY_LINKED = re.compile(r"\]\([^)]*\)|<https?://[^>]*>|https?://\S+")
+#:
+#: `\x00` is excluded from the bare-URL form because by the time it runs, the
+#: masking below has already put markers of that shape into the text, and a
+#: greedy `\S+` would swallow one and strand it in the output.
+_ALREADY_LINKED = re.compile(r"\]\([^)]*\)|<https?://[^>]*>|https?://[^\s\x00]+")
+
+#: Code, fenced or inline.
+#:
+#: Nothing inside it is ours to rewrite: Discord renders no markdown in a code
+#: block, so a link put there shows as its own source. It also matters for what
+#: the block *contains* — a mermaid diagram that failed to render keeps its
+#: source, and diagram source is full of arrows and short hex-ish words that
+#: the commit pass would happily turn into links, corrupting the one copy of
+#: the diagram the reader still has.
+_CODE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]+`", re.DOTALL)
 
 
 #: A reference to an issue in the same repository, GitHub's `#12` shorthand.
@@ -287,19 +302,24 @@ def _link_github_syntax(body: str, repo: str) -> str:
         sha = match.group(1)
         return f"[`{sha[:7]}`](https://github.com/{repo}/commit/{sha})"
 
-    # Cross-references first, while the URLs are still bare — the masking below
-    # would otherwise hide them from this pass.
-    body = _point_at_threads(body, repo)
-
-    # Existing links are lifted out and put back afterwards, so nothing gets
-    # rewritten inside a URL.
+    # Things are lifted out and put back afterwards, so nothing gets rewritten
+    # inside them.
     kept: list[str] = []
 
     def stash(match: re.Match) -> str:
         kept.append(match.group(0))
         return f"\x00{len(kept) - 1}\x00"
 
-    masked = _ALREADY_LINKED.sub(stash, body)
+    # Code first, and before the cross-references too: a `#12` written inside a
+    # code block is part of the code, not a reference to an issue.
+    masked = _CODE.sub(stash, body)
+
+    # Cross-references next, while the URLs are still bare — masking them
+    # would otherwise hide them from this pass.
+    masked = _point_at_threads(masked, repo)
+
+    # Then the links that pass just made, alongside any that were already there.
+    masked = _ALREADY_LINKED.sub(stash, masked)
 
     # Commits first. A Discord mention is `<@` followed by a long run of digits,
     # so substituting mentions first hands the commit pass a snowflake id that
@@ -632,6 +652,7 @@ async def _handle_comment_edited(request: web.Request, repo: str, payload: dict)
         return
 
     text, rendered = await mermaid.diagrams(body)
+    text = tables.convert(text)
     text, image = _readable_in_discord(text)
     text = _link_github_syntax(text, repo)
     embed = discord.Embed(
@@ -779,6 +800,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
 
     is_pull = issue.get("kind") == "pull"
     text, rendered = await mermaid.diagrams(body)
+    text = tables.convert(text)
     text, image = _readable_in_discord(text)
     text = _link_github_syntax(text, repo)
     embed = discord.Embed(
@@ -852,6 +874,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
     # defeats the point of linking it.
     for comment in history or []:
         said, drawn = await mermaid.diagrams(comment.get("body") or "")
+        said = tables.convert(said)
         said, picture = _readable_in_discord(said)
         said = _link_github_syntax(said, repo)
         past = discord.Embed(description=said[:4000] or "*（空留言）*", colour=0x57606A)
@@ -893,6 +916,7 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
     import discord
 
     text, rendered = await mermaid.diagrams(body)
+    text = tables.convert(text)
     text, image = _readable_in_discord(text)
     text = _link_github_syntax(text, repo)
     embed = discord.Embed(

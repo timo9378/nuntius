@@ -23,6 +23,7 @@ import aiohttp
 
 import mermaid
 import store
+import tables
 from web import server
 
 import discord
@@ -147,6 +148,49 @@ async def main() -> int:
     results.append(check("渲染器連不上時沒有附件", files, []))
     results.append(check("渲染器連不上時退回原始碼", text.strip().startswith("```mermaid"), True))
     os.environ.pop("MERMAID_URL", None)
+
+    print("\ntables.convert —— Discord 沒有表格,所以換一種形狀")
+    narrow = tables.convert(
+        "| 旗標 | 預設 | 說明 |\n| --- | --- | --- |\n| --length | 16 | 產生的長度 |"
+    )
+    results.append(check("窄的表格排成等寬", narrow.startswith("```"), True))
+    # The property that matters: a CJK cell and an ASCII cell in the same column
+    # must push the next column to the same place. Comparing whole-line widths
+    # would not catch it — trailing padding is stripped.
+    mixed = tables.convert(
+        "| 名稱 | 說明 |\n| --- | --- |\n| 中文很寬 | 甲 |\n| ascii | 乙 |"
+    ).split("\n")
+    starts = {tables.width(line[: line.index("甲") if "甲" in line else line.index("乙")])
+              for line in mixed if "甲" in line or "乙" in line}
+    results.append(check("中文和英數混排時第二欄對齊", len(starts), 1))
+    wide = tables.convert(
+        "| 情況 | 結果 |\n| --- | --- |\n"
+        "| 少了 --username / 旗標沒給值 / 不認得的旗標 | 印出各自的訊息然後退出 |"
+    )
+    results.append(check("寬的表格攤成條列", wide.startswith("**"), True))
+    results.append(check("條列不會有對不齊的網格", "```" in wide, False))
+    # Every line has to fit, not just the average one: one wrapped line in a
+    # code block destroys the alignment of all of them.
+    fits = all(tables.width(line) <= tables._limit() for line in narrow.split("\n"))
+    results.append(check("留下來的等寬表每一行都在寬度內", fits, True))
+
+    # A shell pipeline is not a table, and a table drawn inside a code block was
+    # put there on purpose.
+    fenced = "```sh\ncat a | grep b\n| 這 | 不是 |\n| --- | --- |\n| 表 | 格 |\n```"
+    results.append(check("code block 裡的管線符號不碰", tables.convert(fenced), fenced))
+    results.append(check("只是含有管線符號的句子不碰",
+                         tables.convert("a | b 這只是一句話"), "a | b 這只是一句話"))
+    # Without the delimiter row there is nothing separating a table from prose.
+    results.append(check("沒有分隔列就不是表格",
+                         tables.convert("| 一 | 二 |\n| 三 | 四 |"), "| 一 | 二 |\n| 三 | 四 |"))
+
+    print("\n程式碼區塊裡的東西不該被改寫")
+    linked = server._link_github_syntax(
+        "看 #42\n\n```\nissue #42 deadbeef\n```\n\n行內 `#42 deadbeef`", "Limatura/tessera"
+    )
+    results.append(check("區塊外的 #42 有連結", "discord.com/channels" in linked, True))
+    results.append(check("圍籬內的 #42 原封不動", "```\nissue #42 deadbeef\n```" in linked, True))
+    results.append(check("行內程式碼也原封不動", "`#42 deadbeef`" in linked, True))
 
     print("\n留言連結 —— 回覆的兩個方向靠它接起來")
     store.remember_comment(777000, "Limatura/tessera", 42, 555)
