@@ -1332,6 +1332,44 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
     if posted is not None:
         store.remember_comment(posted.id, repo, issue_number, comment["id"])
 
+    # Sending may have woken an archived thread; if the issue is closed, it
+    # should not have.
+    await _settle_archive(request, thread_id, payload["issue"])
+
+
+async def _settle_archive(request: web.Request, thread_id: str, issue: dict) -> None:
+    """Puts a thread back to archived after the bot has posted into it.
+
+    Posting into an archived thread un-archives it. That is exactly right when a
+    person says something, and exactly wrong when the bot mirrors a comment that
+    arrived in the same breath as the close: GitHub sends "留言並關閉" as two
+    separate deliveries, they are handled concurrently, and whichever finishes
+    second wins. Half the time that is the comment, which leaves a closed issue
+    with an open thread and nothing in the log to say so.
+
+    Settled by reading the issue's own state rather than by remembering what was
+    just done — the same guard the labels and the title use, and it means a
+    thread whose issue is closed converges on archived no matter which order the
+    deliveries land in.
+
+    Nothing here fights a person: a Discord message reaches GitHub carrying
+    `SYNC_MARKER`, and the echo of it is dropped before this is ever reached.
+    """
+    if (issue.get("state") or "").lower() != "closed":
+        return
+
+    thread = request.app["bot"].get_channel(int(thread_id))
+    if thread is None:
+        return
+    try:
+        # Attempted rather than checked first: the cached `archived` flag is
+        # what the gateway last said, and the send that just happened is
+        # precisely the event it may not have caught up with. Re-archiving an
+        # archived thread costs one call and changes nothing.
+        await thread.edit(archived=True)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("could not re-archive thread %s: %s", thread_id, error)
+
 
 async def _handle_issue_state(
     request: web.Request, repo: str, payload: dict, *, closed: bool
@@ -1373,23 +1411,19 @@ async def _handle_issue_state(
 
 
 async def _update_announcement(bot, thread, *, closed: bool) -> None:
-    """Rewrites the task announcement the thread hangs off.
+    """Rewrites the task card the thread hangs off.
 
-    A thread started from a message shares that message's id, so the thread id
-    is also the announcement's id — no second mapping needed.
+    Through `_card_for`, because the card is in a different place depending on
+    the channel: a text channel's is the announcement the thread was started
+    from, while a forum post's is the post's own opening message. This used to
+    reach for `parent.fetch_message` either way, which a `ForumChannel` does not
+    have — so on a forum, every closed issue kept a card saying 開發中 and left
+    one line in the log to say so.
     """
-    parent = getattr(thread, "parent", None)
-    if parent is None:
+    card = await _card_for(bot, thread.id)
+    if card is None or not card.embeds:
         return
-
-    try:
-        announcement = await parent.fetch_message(thread.id)
-    except Exception as error:  # noqa: BLE001
-        logger.warning("cannot read the announcement for thread %s: %s", thread.id, error)
-        return
-
-    if not announcement.embeds:
-        return
+    announcement = card
 
     cog = bot.get_cog("DevFlow")
     embed = announcement.embeds[0]

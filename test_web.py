@@ -100,6 +100,40 @@ class StubPosted:
         self.channel_id = channel_id
 
 
+class StubForum(discord.ForumChannel):
+    """Enough of a ForumChannel to satisfy `isinstance`, with no gateway behind it.
+
+    `__init__` deliberately does not call super: the point is only that
+    `_card_for` takes the forum branch, which is the branch the old code got
+    wrong.
+    """
+
+    def __init__(self):
+        self.id = 777000
+        self.name = "limatura"
+
+
+class StubForumThread:
+    """A forum post. Its card is its own opening message, not one in the parent."""
+
+    def __init__(self, channel_id):
+        self.id = channel_id
+        self.parent = StubForum()
+        self.name = "#43 論壇上的單"
+        self.starter_message = StubMessage()
+        self.archived = False
+
+    async def send(self, **kwargs):
+        SENT.append((self.id, kwargs))
+        self.archived = False  # Discord wakes a thread when it is posted into
+        return StubPosted(self.id)
+
+    async def edit(self, **kwargs):
+        if "archived" in kwargs:
+            ARCHIVED.append(kwargs["archived"])
+            self.archived = kwargs["archived"]
+
+
 class StubCog:
     """Only the pieces of the real cog the webhook borrows."""
 
@@ -126,6 +160,8 @@ class StubBot:
     def get_channel(self, channel_id):
         # One instance per id: a rename has to still be there on the next look,
         # or the "already says that, do nothing" guards cannot be tested.
+        if channel_id == 555000222:
+            return self.threads.setdefault(channel_id, StubForumThread(channel_id))
         return self.threads.setdefault(channel_id, StubThread(channel_id, self.announcement))
 
     async def fetch_channel(self, channel_id):
@@ -152,7 +188,12 @@ def check(label: str, actual, expected) -> bool:
 
 async def main() -> int:
     # The shape the bot actually writes: issue_number is an int.
-    store.write_threads({"555000111": {"issue_number": 42, "repo": "Limatura/tessera"}})
+    store.write_threads({
+        "555000111": {"issue_number": 42, "repo": "Limatura/tessera"},
+        # A forum post, which is where the card lives in the post's own opening
+        # message rather than in a message in the parent channel.
+        "555000222": {"issue_number": 43, "repo": "Limatura/tessera"},
+    })
 
     results = []
     print("store.thread_for_issue —— 這是舊版永遠回 None 的地方")
@@ -575,6 +616,45 @@ async def main() -> int:
                 "repository": {"full_name": "Limatura/tessera"},
             }), 200))
             results.append(check("而且沒有貼出半截東西", len(SENT) - before, 0))
+
+            print("\n論壇貼文 —— 卡片以前永遠停在「開發中」")
+            before_edits = len(EDITED)
+            results.append(check("論壇上的 issue 關閉事件被接受", await deliver("issues", {
+                "action": "closed",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 43, "state": "closed"},
+            }), 200))
+            # The regression: `parent.fetch_message` does not exist on a
+            # ForumChannel, so the card was never touched and the failure was a
+            # single warning in the log.
+            results.append(check("論壇貼文的卡片有被改", len(EDITED) - before_edits, 1))
+            results.append(check("卡片改成已完成", EDITED[-1]["status"], "✅ 已完成"))
+            results.append(check("貼文封存了", ARCHIVED[-1], True))
+
+            print("\n關閉之後才到的留言不該把封存踢掉")
+            # "留言並關閉" on GitHub is two deliveries handled concurrently. When
+            # the comment lands second it wakes the thread back up.
+            answering = {
+                "action": "created",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 43, "state": "closed"},
+                "comment": {"id": 8005, "body": "順手補一句", "user": {"login": "octocat"},
+                            "html_url": "https://x.invalid/c9"},
+            }
+            results.append(check("留言被接受", await deliver("issue_comment", answering), 200))
+            results.append(check("留言貼進去了", SENT[-1][0], 555000222))
+            results.append(check("封存被放回去", ARCHIVED[-1], True))
+
+            # An issue that is still open must not be archived by the same path.
+            before_archives = len(ARCHIVED)
+            await deliver("issue_comment", {
+                "action": "created",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 43, "state": "open"},
+                "comment": {"id": 8006, "body": "還開著", "user": {"login": "octocat"},
+                            "html_url": "https://x.invalid/c10"},
+            })
+            results.append(check("還開著的單不會被封存", len(ARCHIVED), before_archives))
 
             print("\nissues closed / reopened")
             for action, expected_archived, label in (
