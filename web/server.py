@@ -382,10 +382,24 @@ def _attachments(rendered: list[tuple[str, bytes]]) -> list:
     return [discord.File(io.BytesIO(data), filename=name) for name, data in rendered]
 
 
-async def _post_to_thread(request: web.Request, thread_id: str, **kwargs):
+async def _post_to_thread(
+    request: web.Request, thread_id: str, *, keep_archived: bool = True, **kwargs
+):
     """Sends into a Discord thread — or any channel — using the connected bot.
 
     Returns the message, so callers that need to remember it can.
+
+    Posting into an archived thread un-archives it. That is right for somebody's
+    words and wrong for bookkeeping: being told that a merged pull request got
+    mentioned somewhere is not a reason to put it back on the board. So the
+    default here is to leave the archived state as it was found, and the callers
+    that carry actual conversation — a comment, a review — pass
+    `keep_archived=False` and settle the state against their issue instead.
+
+    Defaulting at the one shared exit rather than deciding at each of the dozen
+    call sites, because the ones that get this wrong are the ones nobody thought
+    about: a late review comment, an assignment on a closed issue, whatever gets
+    added next.
     """
     bot = request.app["bot"]
     channel = bot.get_channel(int(thread_id))
@@ -395,7 +409,16 @@ async def _post_to_thread(request: web.Request, thread_id: str, **kwargs):
         except Exception as error:  # noqa: BLE001 - deleted thread, lost access, anything
             logger.warning("cannot reach Discord thread %s: %s", thread_id, error)
             return None
-    return await channel.send(**kwargs)
+
+    was_archived = bool(getattr(channel, "archived", False))
+    message = await channel.send(**kwargs)
+
+    if keep_archived and was_archived:
+        try:
+            await channel.edit(archived=True)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("could not put thread %s back to archived: %s", thread_id, error)
+    return message
 
 
 async def github_webhook(request: web.Request) -> web.Response:
@@ -814,7 +837,9 @@ async def _handle_pull_request(request: web.Request, repo: str, payload: dict, a
     else:
         note = f"🔓 `{repo}#{number}` 重新開啟,討論串解除封存。"
 
-    await _post_to_thread(request, thread_id, content=note)
+    # Followed immediately by `thread.edit(archived=...)`, so preserving the
+    # old state here would only churn.
+    await _post_to_thread(request, thread_id, content=note, keep_archived=False)
 
     bot = request.app["bot"]
     thread = bot.get_channel(int(thread_id))
@@ -953,8 +978,10 @@ async def _handle_review(request: web.Request, repo: str, payload: dict) -> None
     embed.set_footer(text=f"{repo}#{pull['number']}")
 
     await _post_to_thread(
-        request, thread_id, content=f"{headline}{' ' + ping if ping else ''}", embed=embed
+        request, thread_id, content=f"{headline}{' ' + ping if ping else ''}", embed=embed,
+        keep_archived=False,
     )
+    await _settle_archive(request, thread_id, pull)
 
 
 async def _handle_review_comment(request: web.Request, repo: str, payload: dict, action: str) -> None:
@@ -1034,9 +1061,10 @@ async def _handle_review_comment(request: web.Request, repo: str, payload: dict,
                 message_id=answering, channel_id=int(thread_id), fail_if_not_exists=False
             )
 
-    posted = await _post_to_thread(request, thread_id, embed=embed, **extra)
+    posted = await _post_to_thread(request, thread_id, embed=embed, keep_archived=False, **extra)
     if posted is not None:
         store.remember_comment(posted.id, repo, number, comment["id"], kind="review")
+    await _settle_archive(request, thread_id, pull)
 
 
 #: Conclusions worth waking somebody for.
@@ -1457,7 +1485,7 @@ async def _handle_comment(request: web.Request, repo: str, payload: dict) -> Non
             fail_if_not_exists=False,
         )
 
-    posted = await _post_to_thread(request, thread_id, embed=embed, **extra)
+    posted = await _post_to_thread(request, thread_id, embed=embed, keep_archived=False, **extra)
 
     # So that reacting to this message in Discord lands on the GitHub comment it
     # came from. Only messages going the *other* way were recorded before, which
@@ -1527,6 +1555,9 @@ async def _handle_issue_state(
             if closed
             else f"🔓 `{repo}#{issue_number}` 在 GitHub 被重新開啟,討論串解除封存。"
         ),
+        # The archived state is set explicitly below; this is the one message
+        # that is allowed to change it.
+        keep_archived=False,
     )
 
     bot = request.app["bot"]

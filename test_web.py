@@ -341,7 +341,8 @@ async def main() -> int:
     results.append(check("permalink 指到那一則訊息", "/555000111/777000" in rewritten, True))
     results.append(check("permalink 沒有被切成兩半", "#issuecomment-" in rewritten, False))
 
-    runner = await server.start(StubBot(), "127.0.0.1", 18099)
+    bot = StubBot()
+    runner = await server.start(bot, "127.0.0.1", 18099)
     base = "http://127.0.0.1:18099"
     try:
         async with aiohttp.ClientSession() as session:
@@ -726,6 +727,21 @@ async def main() -> int:
             unmirrored = SENT[-1][1]["content"]
             results.append(check("沒有討論串時退回 GitHub 連結",
                                  "github.com/Limatura/tessera/pull/201" in unmirrored, True))
+
+            # The reported bug: a merged pull request's post kept coming back to
+            # the top of the forum because a later cross-reference woke it.
+            forum = bot.get_channel(555000222)
+            forum.archived = True
+            before = len(SENT)
+            await deliver("pull_request", {
+                "action": "opened",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 202, "title": "另一個 PR", "body": "跟 #43 有關",
+                                 "html_url": "https://x.invalid/pr202",
+                                 "user": {"login": "timo9378"}, "labels": []},
+            })
+            results.append(check("已封存的貼文有收到通知", len(SENT) - before, 1))
+            results.append(check("但沒有被通知叫醒", forum.archived, True))
 
             # An issue whose body lists itself must not notify itself.
             before = len(SENT)
