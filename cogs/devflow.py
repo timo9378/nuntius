@@ -13,6 +13,7 @@ import functools
 
 import projects
 import store
+import vocabulary
 from web import server
 
 logger = logging.getLogger(__name__)
@@ -1151,14 +1152,9 @@ class DevFlow(commands.Cog):
         found this command.
         """
         mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
-        if not mapping or not self.github_bot_token:
+        if not mapping:
             return []
-        try:
-            gh = await self._run_sync(Github, self.github_bot_token)
-            repo = await self._run_sync(gh.get_repo, mapping["repo"])
-            titles = [m.title for m in await self._run_sync(repo.get_milestones, state="open")]
-        except GithubException:
-            return []
+        titles = await vocabulary.milestones(mapping["repo"])
         return [
             app_commands.Choice(name=title, value=title)
             for title in titles
@@ -1166,16 +1162,17 @@ class DevFlow(commands.Cog):
         ][:25]
 
     async def label_autocomplete(self, interaction: Interaction, current: str):
-        """The repository's own labels, so nobody types one that does not exist."""
+        """The repository's own labels, so nobody types one that does not exist.
+
+        Through `vocabulary` rather than PyGithub: this runs on every keystroke,
+        and Discord abandons an autocomplete that takes longer than three
+        seconds. See that module for why the answer can be cached without going
+        out of step.
+        """
         mapping = self.thread_issue_mappings.get(str(interaction.channel.id))
-        if not mapping or not self.github_bot_token:
+        if not mapping:
             return []
-        try:
-            gh = await self._run_sync(Github, self.github_bot_token)
-            repo = await self._run_sync(gh.get_repo, mapping["repo"])
-            names = [label.name for label in await self._run_sync(repo.get_labels)]
-        except GithubException:
-            return []
+        names = await vocabulary.labels(mapping["repo"])
         return [
             app_commands.Choice(name=name, value=name)
             for name in names

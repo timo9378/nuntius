@@ -25,6 +25,7 @@ import aiohttp
 import mermaid
 import store
 import tables
+import vocabulary
 from web import server
 
 import discord
@@ -268,6 +269,52 @@ async def main() -> int:
     results.append(check("區塊外的 #42 有連結", "discord.com/channels" in linked, True))
     results.append(check("圍籬內的 #42 原封不動", "```\nissue #42 deadbeef\n```" in linked, True))
     results.append(check("行內程式碼也原封不動", "`#42 deadbeef`" in linked, True))
+
+    print("\nvocabulary —— 自動完成每一鍵都跑,所以要快取")
+    calls = []
+
+    async def counted(repo, kind, params, field):
+        calls.append((repo, kind))
+        return ["Bug", "Feature"] if kind == "labels" else ["v1"]
+
+    real_fetch, vocabulary._fetch = vocabulary._fetch, counted
+    vocabulary._cache.clear()
+    try:
+        results.append(check("第一次會去問 GitHub",
+                             await vocabulary.labels("Limatura/tessera"), ["Bug", "Feature"]))
+        await vocabulary.labels("Limatura/tessera")
+        await vocabulary.labels("Limatura/tessera")
+        results.append(check("後面幾次都吃快取,沒有再問", len(calls), 1))
+
+        # Two repositories must not answer for each other.
+        await vocabulary.labels("Limatura/tessera-docs")
+        results.append(check("不同 repo 各自一份", len(calls), 2))
+        # Labels and milestones are separate lists on the same repository.
+        await vocabulary.milestones("Limatura/tessera")
+        results.append(check("標籤和里程碑分開快取", len(calls), 3))
+
+        # The whole reason caching is safe here: GitHub says when it changed.
+        vocabulary.forget("Limatura/tessera")
+        await vocabulary.labels("Limatura/tessera")
+        results.append(check("webhook 說變了就重新去問", len(calls), 4))
+        await vocabulary.labels("Limatura/tessera-docs")
+        results.append(check("清掉的只有那一個 repo", len(calls), 4))
+
+        # A hiccup must not make the autocomplete claim there are no labels.
+        async def broken(repo, kind, params, field):
+            calls.append((repo, kind))
+            return None
+
+        vocabulary._fetch = broken
+        vocabulary._cache[("limatura/tessera", "labels")] = (0, ["Bug"])  # expired
+        results.append(check("GitHub 掛掉時給舊的而不是空的",
+                             await vocabulary.labels("Limatura/tessera"), ["Bug"]))
+        vocabulary._cache.clear()
+        results.append(check("沒有舊的可給就給空的",
+                             await vocabulary.labels("Limatura/tessera"), []))
+    finally:
+        vocabulary._fetch = real_fetch
+        vocabulary._cache.clear()
 
     print("\n留言連結 —— 回覆的兩個方向靠它接起來")
     store.remember_comment(777000, "Limatura/tessera", 42, 555)

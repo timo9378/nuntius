@@ -59,6 +59,8 @@ docker compose up -d
    | 事件 | 沒勾的話 |
    | --- | --- |
    | Issues | GitHub → Discord 整個方向都不會動 |
+   | Labels | 標籤自動完成會拿到過期的清單(最多 5 分鐘) |
+   | Milestones | 里程碑自動完成同上 |
    | Issue comments | 留言不會回到討論串 |
    | Pull requests | PR 不會有卡片,標籤和負責人也不會更新 |
    | Pull request reviews | approve 和「要求修改」在 Discord 看不到 |
@@ -126,6 +128,16 @@ DEV_ANNOUNCE_CHANNELS=owner/one=123,owner/two=456
 沒列到的走 `DEV_ANNOUNCE_CHANNEL_ID`,所以只追一個 repo 的話這裡留空。兩個專案的待辦混在同一個論壇裡,兩邊都會變難讀。
 
 **有列到但頻道找不到的 repo 會什麼都不發,不會退回預設頻道。** 把一個專案的單安靜地丟進另一個專案的論壇,比不發更糟:錯誤看不出來,而且要收拾得一則一則手動刪。啟動時會把每個 repo 對到哪個頻道寫進 log,對不到的會標 `NOT FOUND`。
+
+## 自動完成
+
+`/label` 和 `/milestone` 的選項是 repo 現有的標籤和里程碑,而自動完成**每敲一個鍵就跑一次** —— 而且 Discord 給它三秒,超過就直接不顯示任何選項、不會報錯。
+
+所以那份清單有快取,每個 repo 一份,標籤和里程碑分開。第一次約 400ms,之後 0ms。
+
+**快取在這裡不會不同步**,因為這份詞彙只可能從 GitHub 那側改,而那一側正好有 webhook:`label` 和 `milestone` 事件一到就把那個 repo 的快取清掉。bot 自己不會擴充詞彙 —— `/label` 只在現有標籤之間切換、`/milestone` 只套用現有的,兩個都刻意不建立新的,所以沒有第二個寫入者會漏掉。
+
+`TTL`(5 分鐘)是漏收 delivery 時的安全網,不是主要機制。GitHub 讀不到的時候會給上一次的結果而不是空的 —— 突然變成沒有選項會被讀成「這個 repo 沒有標籤」,那比舊資料更容易誤導。
 
 ## 資料
 

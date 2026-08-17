@@ -21,6 +21,7 @@ from aiohttp import web
 import mermaid
 import store
 import tables
+import vocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -457,6 +458,15 @@ async def _dispatch(request: web.Request, repo: str, event: str, payload: dict) 
         await _handle_review_comment(request, repo, payload, action)
     elif event == "workflow_run" and action == "completed":
         await _handle_workflow_run(request, repo, payload)
+    elif event in ("label", "milestone"):
+        # Not mirrored anywhere — the repository's vocabulary just changed, and
+        # the autocompletes may be holding a copy of the old one.
+        #
+        # Said out loud whether or not anything was cached: this delivery is the
+        # only evidence that the subscription is wired up at all, and a cache
+        # that silently never invalidates looks exactly like one that does.
+        logger.info("%s %s on %s", event, action, repo)
+        vocabulary.forget(repo)
 
 
 #: The embed field milestones live in. A constant because two places have to
