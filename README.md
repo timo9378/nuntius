@@ -35,6 +35,7 @@
 - **標籤** — 雙向。GitHub 加減 label 會改論壇貼文的標籤,反過來也是
 - **里程碑** — 顯示在卡片上,GitHub 那邊改了會跟著更新
 - **互相連結** — 在 Discord 貼別的討論串連結,到 GitHub 變成 `#12` 引用(所以兩張單的時間軸都看得到);GitHub 的 `#12` 到 Discord 變成討論串連結
+- **被提及** — PR 寫 `Closes #3`、或別的單的留言提到 `#3`,`#3` 的討論串會收到通知(會關閉的講法和單純提及的講法不一樣)。GitHub 沒有這個 webhook —— `cross-referenced` 只存在於 timeline API —— 所以是從**做引用的那一方**的內文解析出來的,而那筆 delivery 本來就會收到
 - **刪除** — 雙向。刪掉 Discord 訊息會刪掉對應的 GitHub 留言,反過來也是
 - **圖表** — GitHub 的 ` ```mermaid ` 在 Discord 渲染成圖片附上去。Discord 的 markdown 根本不看 fence 的語言,所以不畫成圖就只是一堆箭頭。見下面〈圖表〉
 - **表格** — Discord 的 markdown 沒有表格,`|` 對它是普通字元。所以表格會先排成等寬再量寬度:放得下就包進 code block,放不下就攤成條列。見下面〈表格〉

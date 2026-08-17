@@ -417,6 +417,9 @@ async def github_webhook(request: web.Request) -> web.Response:
 
     try:
         await _dispatch(request, repo, event, payload)
+        # After the main handling, because a referenced issue's thread should
+        # already exist by the time it is told about the reference.
+        await _references_from(request, repo, event, payload.get("action") or "", payload)
     except Exception as error:  # noqa: BLE001
         # Answered as accepted even so, and deliberately. A 500 makes GitHub
         # redeliver, and these handlers post to Discord *before* they finish —
@@ -1133,6 +1136,104 @@ async def _handle_workflow_run(request: web.Request, repo: str, payload: dict) -
         request,
         channel_id,
         content=f"❌ **{name}** {verb} · {where}{who}\n<{run.get('html_url', '')}>",
+    )
+
+
+#: A reference to another issue, with the closing keywords GitHub itself acts on.
+#:
+#: Two alternatives rather than one optional prefix, because the guard that stops
+#: `abc#1` and `.../issues/3#issuecomment-9` from matching is a lookbehind, and a
+#: lookbehind cannot sit after an optional group that may have just consumed a
+#: word character.
+_REFERENCE = re.compile(
+    r"(?P<closing>\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+)?"
+    r"(?:(?P<repo>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(?P<qualified>\d+)"
+    r"|(?<![\w#/])#(?P<bare>\d+))\b",
+    re.IGNORECASE,
+)
+
+#: Enough for a release note that lists what went into it; past that, something
+#: is generating text and every thread it names does not need telling.
+MAX_REFERENCES = 10
+
+
+def _references_in(body: str, repo: str) -> list[tuple[str, int, bool]]:
+    """The issues a body points at, as `(repo, number, closes)`.
+
+    Code is stripped first: a `#12` inside a fence is part of the code, and
+    announcing it into somebody's thread is a false alarm about work nobody did.
+    """
+    found: list[tuple[str, int, bool]] = []
+    seen: set[tuple[str, int]] = set()
+    for match in _REFERENCE.finditer(_CODE.sub(" ", body or "")):
+        number = int(match.group("qualified") or match.group("bare"))
+        where = (match.group("repo") or repo).lower()
+        if (where, number) in seen:
+            continue
+        seen.add((where, number))
+        found.append((where, number, bool(match.group("closing"))))
+        if len(found) >= MAX_REFERENCES:
+            break
+    return found
+
+
+async def _announce_references(
+    request: web.Request, repo: str, describe: str, url: str, number: int, body: str
+) -> None:
+    """Tells a thread that something elsewhere just pointed at its issue.
+
+    GitHub records this on the issue's own timeline, and there is no webhook for
+    it — `cross-referenced` is a timeline event, not a delivery. So it is read
+    out of the body that *does* arrive: the pull request or comment doing the
+    referencing. Being told that a PR will close your issue is the sort of thing
+    the thread exists for, and without this it only ever showed up on GitHub.
+    """
+    for where, target, closes in _references_in(body, repo):
+        if where == repo.lower() and target == number:
+            continue  # an issue referring to itself, usually in a checklist
+        thread_id = store.thread_for_issue(where, target)
+        if not thread_id:
+            continue
+        await _post_to_thread(
+            request,
+            thread_id,
+            content=(
+                f"🔗 {describe} {'會在合併時關閉這張單' if closes else '提到了這張單'}\n{url}"
+            ),
+        )
+        logger.info("%s references %s#%s", describe, where, target)
+
+
+async def _references_from(
+    request: web.Request, repo: str, event: str, action: str, payload: dict
+) -> None:
+    """Whichever body just arrived, scanned for references to other issues."""
+    if event == "issues" and action == "opened":
+        issue = payload["issue"]
+        describe = f"**#{issue['number']}**「{(issue.get('title') or '')[:40]}」"
+    elif event == "pull_request" and action == "opened":
+        issue = payload["pull_request"]
+        describe = f"**PR #{issue['number']}**「{(issue.get('title') or '')[:40]}」"
+    elif event == "issue_comment" and action == "created":
+        body = payload["comment"].get("body") or ""
+        # Comments this bot wrote are Discord messages already. The person who
+        # pasted the link is looking at it, GitHub has recorded the reference on
+        # its own timeline, and `/close` and the backfill both write long bodies
+        # that would otherwise set off a burst of these.
+        if store.SYNC_MARKER in body:
+            return
+        issue = payload["issue"]
+        where = f"PR #{issue['number']}" if issue.get("pull_request") else f"#{issue['number']}"
+        describe = f"**{payload['comment']['user']['login']}** 在 {where} 的留言"
+        await _announce_references(
+            request, repo, describe, payload["comment"]["html_url"], issue["number"], body
+        )
+        return
+    else:
+        return
+
+    await _announce_references(
+        request, repo, describe, issue["html_url"], issue["number"], issue.get("body") or ""
     )
 
 

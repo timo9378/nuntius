@@ -664,6 +664,59 @@ async def main() -> int:
             }), 200))
             results.append(check("而且沒有貼出半截東西", len(SENT) - before, 0))
 
+            print("\n交叉引用 —— GitHub 只有 timeline,沒有 webhook")
+            R = server._references_in
+            results.append(check("Closes #42 認得出是會關閉的",
+                                 R("Closes #42", "Limatura/tessera"),
+                                 [("limatura/tessera", 42, True)]))
+            results.append(check("純提及不是關閉",
+                                 R("跟 #42 有關", "Limatura/tessera"),
+                                 [("limatura/tessera", 42, False)]))
+            results.append(check("跨 repo 的完整寫法",
+                                 R("見 other/repo#7", "Limatura/tessera"),
+                                 [("other/repo", 7, False)]))
+            results.append(check("同一個編號只算一次",
+                                 R("#42 然後又 #42", "Limatura/tessera"),
+                                 [("limatura/tessera", 42, False)]))
+            # The ones that would fire a false alarm into somebody's thread.
+            results.append(check("程式碼區塊裡的 #42 不算",
+                                 R("```\n#42\n```", "Limatura/tessera"), []))
+            results.append(check("行內程式碼裡的也不算",
+                                 R("`#42`", "Limatura/tessera"), []))
+            results.append(check("留言永久連結不是引用",
+                                 R("https://github.com/a/b/issues/3#issuecomment-555",
+                                   "Limatura/tessera"), []))
+            results.append(check("CSS 顏色不是引用", R("色碼 #fff", "Limatura/tessera"), []))
+            results.append(check("markdown 標題不是引用", R("# 標題", "Limatura/tessera"), []))
+            results.append(check("abc#1 不是引用", R("abc#1", "Limatura/tessera"), []))
+
+            # End to end: a PR body pointing at an issue that has a thread.
+            before = len(SENT)
+            results.append(check("PR 開啟事件被接受", await deliver("pull_request", {
+                "action": "opened",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 200, "title": "改好登入", "body": "Closes #42",
+                                 "html_url": "https://x.invalid/pr200",
+                                 "user": {"login": "timo9378"}, "labels": []},
+            }), 200))
+            told = [k for c, k in SENT[before:] if c == 555000111
+                    and "提到" in k.get("content", "") or "關閉這張單" in k.get("content", "")]
+            results.append(check("被引用的討論串收到通知", len(told), 1))
+            results.append(check("說了是會關閉不是只是提到",
+                                 "會在合併時關閉這張單" in told[0]["content"], True))
+
+            # An issue whose body lists itself must not notify itself.
+            before = len(SENT)
+            await deliver("issues", {
+                "action": "opened",
+                "repository": {"full_name": "Limatura/tessera"},
+                "issue": {"number": 42, "title": "自己", "body": "見 #42 和 #43",
+                          "html_url": "https://x.invalid/i42", "user": {"login": "a"}, "labels": []},
+            })
+            hit = [c for c, _ in SENT[before:]]
+            results.append(check("不會通知自己", 555000111 in hit, False))
+            results.append(check("但別人還是通知得到", 555000222 in hit, True))
+
             print("\n論壇貼文 —— 卡片以前永遠停在「開發中」")
             before_edits = len(EDITED)
             results.append(check("論壇上的 issue 關閉事件被接受", await deliver("issues", {
