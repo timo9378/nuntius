@@ -619,21 +619,62 @@ async def main() -> int:
 
             # The lookup needs GitHub; the handler's own logic is what is under
             # test, so the pull request is handed to it directly.
+            asked = []
             original = server._pull_for_run
-            server._pull_for_run = lambda repo, run: _answer(
-                {"number": 42, "user": {"login": "timo9378"}}
-            )
+
+            def stub_lookup(repo, run):
+                asked.append(run.get("event"))
+                return _answer({"number": 42, "user": {"login": "timo9378"}})
+
+            server._pull_for_run = stub_lookup
             try:
                 await deliver("workflow_run", {
                     "action": "completed",
                     "repository": {"full_name": "Limatura/tessera"},
                     "workflow_run": {"name": "build", "conclusion": "failure",
+                                     "event": "pull_request", "head_branch": "feat/x",
                                      "html_url": "https://x.invalid/run3",
                                      "pull_requests": [{"number": 42}]},
                 })
+                # A push that broke the branch names both: which branch is
+                # broken, and what just landed on it.
+                await deliver("workflow_run", {
+                    "action": "completed",
+                    "repository": {"full_name": "Limatura/tessera"},
+                    "workflow_run": {"name": "web", "conclusion": "failure",
+                                     "event": "push", "head_branch": "main",
+                                     "html_url": "https://x.invalid/run5",
+                                     "pull_requests": []},
+                })
+                pushed = SENT[-1][1]["content"]
+
+                # A nightly build is nobody's fault in particular, and naming
+                # whoever merged last would ping them every morning.
+                before_sched = len(asked)
+                await deliver("workflow_run", {
+                    "action": "completed",
+                    "repository": {"full_name": "Limatura/tessera"},
+                    "workflow_run": {"name": "rust", "conclusion": "failure",
+                                     "event": "schedule", "head_branch": "main",
+                                     "html_url": "https://x.invalid/run6",
+                                     "pull_requests": []},
+                })
+                scheduled = SENT[-1][1]["content"]
             finally:
                 server._pull_for_run = original
-            channel, kwargs = SENT[-1]
+
+            results.append(check("push 壞掉會同時說分支和剛合併的 PR",
+                                 "`main` · 剛合併的" in pushed, True))
+            results.append(check("push 壞掉會點名合併的人", "timo9378" in pushed, True))
+            results.append(check("排程失敗不去查 PR", len(asked), before_sched))
+            results.append(check("排程失敗不點名任何人", "@" in scheduled or "timo9378" in scheduled, False))
+            results.append(check("排程失敗只說是哪個分支", "`main`" in scheduled, True))
+
+            # Found by its run link rather than by index — three deliveries
+            # went out above and counting backwards is how that breaks later.
+            channel, kwargs = next(
+                (c, k) for c, k in reversed(SENT) if "run3" in (k.get("content") or "")
+            )
             content = kwargs.get("content", "")
             results.append(check("送進 CI 頻道而不是討論串", channel, 1537700084681154660))
             results.append(check("說是哪個 workflow", "**build** 失敗" in content, True))

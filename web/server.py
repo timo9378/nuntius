@@ -1075,36 +1075,52 @@ async def _handle_review_comment(request: web.Request, repo: str, payload: dict,
 CI_FAILURES = {"failure", "timed_out", "action_required"}
 
 
+#: Runs nobody in particular caused, so nobody in particular gets named.
+#:
+#: A nightly build failing says something about the repository, not about
+#: whoever merged last — and attributing it to them would ping the same person
+#: every morning for something they may have had nothing to do with.
+UNATTRIBUTED_EVENTS = {"schedule", "workflow_dispatch"}
+
+
 async def _pull_for_run(repo: str, run: dict) -> dict | None:
     """The pull request a workflow run belongs to.
 
-    `pull_requests` in the payload is empty more often than the shape suggests
-    — notably for runs on forks — so the branch is the fallback. Fetched rather
-    than guessed because the run does not carry who opened the pull request,
-    and that is who needs telling.
+    Resolved from the head commit rather than from `pull_requests`, which is
+    empty far more often than its presence in the payload suggests — including
+    on `pull_request`-triggered runs, where it should be the one reliable case.
+    Two of the four failures that prompted this had an empty array.
+
+    Nor by branch: that was the previous fallback, and it asked for *open* pull
+    requests. The one that exposed it was opened and merged nine seconds apart,
+    so by the time CI failed there was no open pull request on that branch and
+    the author went unnamed. Widening it to every state does not help either —
+    a reused branch name has fifteen of them.
+
+    The commit is the thing that actually identifies the work: it finds merged
+    and closed pull requests, it works across forks, and it carries the author,
+    so this is one request rather than two.
     """
     token = os.getenv("GITHUB_BOT_TOKEN")
-    if not token:
+    sha = run.get("head_sha")
+    if not token or not sha:
         return None
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    numbers = [p["number"] for p in run.get("pull_requests") or [] if p.get("number")]
     try:
         async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-            if not numbers:
-                branch = run.get("head_branch")
-                if not branch:
-                    return None
-                owner = repo.split("/")[0]
-                async with session.get(
-                    f"{GITHUB_API}/repos/{repo}/pulls",
-                    params={"head": f"{owner}:{branch}", "state": "open"},
-                    headers=headers,
-                ) as response:
-                    found = await response.json()
-                if not isinstance(found, list) or not found:
-                    return None
+            async with session.get(
+                f"{GITHUB_API}/repos/{repo}/commits/{sha}/pulls", headers=headers
+            ) as response:
+                found = await response.json()
+            if isinstance(found, list) and found:
                 return found[0]
+
+            # Belt and braces: if the commit lookup comes back empty but the
+            # payload named a number after all, take it at its word.
+            numbers = [p["number"] for p in run.get("pull_requests") or [] if p.get("number")]
+            if not numbers:
+                return None
             async with session.get(
                 f"{GITHUB_API}/repos/{repo}/pulls/{numbers[0]}", headers=headers
             ) as response:
@@ -1140,23 +1156,30 @@ async def _handle_workflow_run(request: web.Request, repo: str, payload: dict) -
     verb = {"timed_out": "逾時", "action_required": "需要處理"}.get(conclusion, "失敗")
     name = run.get("name") or "CI"
 
-    pull = await _pull_for_run(repo, run)
+    branch = run.get("head_branch") or "?"
+    event = run.get("event") or ""
+    pull = None if event in UNATTRIBUTED_EVENTS else await _pull_for_run(repo, run)
+
     if pull is None:
-        # A run with no pull request behind it — nearly always a push straight
-        # to the default branch. Still worth reporting, and arguably the most
-        # worth reporting; there is just nobody in particular to point at.
-        where = f"`{run.get('head_branch') or '?'}`"
+        # A run with no pull request behind it — a direct push, or a nightly.
+        # Still worth reporting; there is just nobody in particular to point at.
+        where = f"`{branch}`"
         who = ""
     else:
         number = pull["number"]
         thread_id = store.thread_for_issue(repo, number)
         # Linked into Discord where the conversation already is, so the channel
         # is somewhere to act from rather than only somewhere to be told.
-        where = (
+        reference = (
             f"[{repo}#{number}](https://discord.com/channels/{GUILD_ID}/{thread_id})"
             if thread_id and GUILD_ID
             else f"`{repo}#{number}`"
         )
+        # On a push the run is not *about* the pull request, it is about the
+        # branch the pull request landed on — so say both. "main is broken and
+        # this is what just went in" is a different sentence from "your pull
+        # request is failing", and the person named needs to know which.
+        where = f"`{branch}` · 剛合併的 {reference}" if event == "push" else reference
         author = (pull.get("user") or {}).get("login", "")
         who = f" {_name_or_mention(author)}" if author else ""
 
