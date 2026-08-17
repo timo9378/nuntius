@@ -1177,6 +1177,22 @@ def _references_in(body: str, repo: str) -> list[tuple[str, int, bool]]:
     return found
 
 
+def _discord_url(repo: str, number: int, message_id: int | None = None) -> str | None:
+    """A link into Discord for an issue's thread, or one message inside it.
+
+    `None` when there is nothing to point at — no guild configured, or an issue
+    this instance does not mirror. Callers fall back to GitHub, which is where
+    the reader would have had to go anyway.
+    """
+    if not GUILD_ID:
+        return None
+    thread_id = store.thread_for_issue(repo, number)
+    if not thread_id:
+        return None
+    inside = f"https://discord.com/channels/{GUILD_ID}/{thread_id}"
+    return f"{inside}/{message_id}" if message_id else inside
+
+
 async def _announce_references(
     request: web.Request, repo: str, describe: str, url: str, number: int, body: str
 ) -> None:
@@ -1225,15 +1241,22 @@ async def _references_from(
         issue = payload["issue"]
         where = f"PR #{issue['number']}" if issue.get("pull_request") else f"#{issue['number']}"
         describe = f"**{payload['comment']['user']['login']}** 在 {where} 的留言"
-        await _announce_references(
-            request, repo, describe, payload["comment"]["html_url"], issue["number"], body
-        )
+        # Straight to the mirrored message, so the link lands on the sentence
+        # that did the referencing rather than at the top of the thread.
+        mirrored = store.message_for_comment(repo, payload["comment"]["id"])
+        url = (_discord_url(repo, issue["number"], mirrored)
+               or payload["comment"]["html_url"])
+        await _announce_references(request, repo, describe, url, issue["number"], body)
         return
     else:
         return
 
+    # Into Discord where the thread exists — everything else in this bot points
+    # inward, and a notification that bounces the reader to a browser is the one
+    # thing the mirror is supposed to stop.
+    url = _discord_url(repo, issue["number"]) or issue["html_url"]
     await _announce_references(
-        request, repo, describe, issue["html_url"], issue["number"], issue.get("body") or ""
+        request, repo, describe, url, issue["number"], issue.get("body") or ""
     )
 
 

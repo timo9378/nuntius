@@ -194,6 +194,9 @@ async def main() -> int:
         # A forum post, which is where the card lives in the post's own opening
         # message rather than in a message in the parent channel.
         "555000222": {"issue_number": 43, "repo": "Limatura/tessera"},
+        # A pull request with a thread of its own, so a reference to it has
+        # somewhere inward to point.
+        "555000333": {"issue_number": 200, "repo": "Limatura/tessera"},
     })
 
     results = []
@@ -704,6 +707,25 @@ async def main() -> int:
             results.append(check("被引用的討論串收到通知", len(told), 1))
             results.append(check("說了是會關閉不是只是提到",
                                  "會在合併時關閉這張單" in told[0]["content"], True))
+            # The PR got its own thread a moment ago; the link must go there,
+            # not bounce the reader out to a browser.
+            results.append(check("連回 Discord 而不是 GitHub",
+                                 "discord.com/channels" in told[0]["content"], True))
+            results.append(check("沒有留下 github 連結",
+                                 "github.com" in told[0]["content"], False))
+
+            # An issue this instance does not mirror has nowhere inward to point.
+            before = len(SENT)
+            await deliver("pull_request", {
+                "action": "opened",
+                "repository": {"full_name": "Limatura/tessera"},
+                "pull_request": {"number": 201, "title": "沒有討論串的 PR", "body": "Closes #42",
+                                 "html_url": "https://github.com/Limatura/tessera/pull/201",
+                                 "user": {"login": "timo9378"}, "labels": []},
+            })
+            unmirrored = SENT[-1][1]["content"]
+            results.append(check("沒有討論串時退回 GitHub 連結",
+                                 "github.com/Limatura/tessera/pull/201" in unmirrored, True))
 
             # An issue whose body lists itself must not notify itself.
             before = len(SENT)
