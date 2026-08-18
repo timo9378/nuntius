@@ -618,6 +618,54 @@ async def _handle_assignees(request: web.Request, repo: str, payload: dict) -> N
     )
 
 
+#: How many tags Discord allows on one forum post.
+MAX_FORUM_TAGS = 5
+
+
+def _kind_tag_names() -> set[str]:
+    return {
+        name.strip().lower()
+        for name in (os.getenv("PR_FORUM_TAG", ""), os.getenv("ISSUE_FORUM_TAG", ""))
+        if name.strip()
+    }
+
+
+def kind_tag(channel, is_pull: bool):
+    """The tag that says whether a post is a pull request or an issue.
+
+    A forum list shows a title and its tags, and nothing in a title reliably
+    says which of the two it is — so fifty issues and fifty pull requests read
+    as one undifferentiated pile. This is the one dimension the label tags
+    cannot carry, because GitHub has no label for it: on GitHub the distinction
+    is structural, and it is only in a forum listing that it goes missing.
+
+    `None` when the tag is not configured or the forum does not have it, which
+    is how an instance opts out.
+    """
+    wanted = ((os.getenv("PR_FORUM_TAG") if is_pull else os.getenv("ISSUE_FORUM_TAG")) or "").strip().lower()
+    if not wanted:
+        return None
+    return next((tag for tag in channel.available_tags if tag.name.lower() == wanted), None)
+
+
+def forum_tags(channel, labels: list[str], *, is_pull: bool | None = None, keep=()) -> list:
+    """What a post should be tagged: what it *is*, then what it is *about*.
+
+    The kind goes first because Discord truncates the tag row before it
+    truncates the title, and of the five slots it is the one always worth
+    spending — a post's labels are visible in its card, its kind is not.
+    """
+    tags = [tag for tag in keep]
+    if is_pull is not None:
+        tag = kind_tag(channel, is_pull)
+        if tag is not None and tag not in tags:
+            tags.insert(0, tag)
+    for tag in tags_for_labels(channel, labels):
+        if tag not in tags and len(tags) < MAX_FORUM_TAGS:
+            tags.append(tag)
+    return tags[:MAX_FORUM_TAGS]
+
+
 def tags_for_labels(channel, labels: list[str]) -> list:
     """The forum tags that correspond to a set of GitHub labels.
 
@@ -655,7 +703,12 @@ async def _handle_labels(request: web.Request, repo: str, payload: dict) -> None
         return
 
     labels = [label["name"] for label in issue.get("labels", [])]
-    wanted = tags_for_labels(thread.parent, labels)
+    # The kind tag is carried over rather than recomputed: this handler is
+    # reached from both `issues` and `pull_request` deliveries and cannot tell
+    # them apart, and the answer never changes anyway — a pull request does not
+    # become an issue. Without this, the first label change strips it off.
+    keep = [tag for tag in thread.applied_tags if tag.name.lower() in _kind_tag_names()]
+    wanted = forum_tags(thread.parent, labels, keep=keep)
 
     # Nothing to do when the tags already say what the labels say. This is the
     # loop guard for the whole two-way arrangement: a change made on either
@@ -1396,7 +1449,7 @@ async def announce_issue(bot, channel, repo: str, issue: dict, history: list[dic
             #
             # Labels map onto forum tags by name where the names line up.
             # Discord allows five per post.
-            tags = tags_for_labels(channel, labels)
+            tags = forum_tags(channel, labels, is_pull=is_pull)
 
             # A forum can be configured to demand a tag on every post, and an
             # issue with no labels then cannot be posted at all — which is how

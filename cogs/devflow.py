@@ -667,8 +667,16 @@ class DevFlow(commands.Cog):
         except GithubException:
             return
 
+        # The kind tags say what a post *is*, not what it is about. They are
+        # deliberately not part of the shared vocabulary, so they never become
+        # labels — even if somebody later creates a GitHub label spelled the
+        # same way.
+        structural = server._kind_tag_names()  # noqa: SLF001
+
         wanted = []
         for tag in thread.applied_tags:
+            if tag.name.lower() in structural:
+                continue
             for candidate in (tag.name, reverse.get(tag.name.lower(), "")):
                 if candidate and candidate.lower() in available:
                     wanted.append(available[candidate.lower()])

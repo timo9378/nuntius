@@ -319,6 +319,57 @@ async def main() -> int:
         vocabulary._fetch = real_fetch
         vocabulary._cache.clear()
 
+    print("\n論壇標籤 —— PR 和 issue 在列表上長得一模一樣")
+
+    class Tag:
+        def __init__(self, name):
+            self.name = name
+            self.id = abs(hash(name)) % 10**9
+
+        def __eq__(self, other):
+            return getattr(other, "id", None) == self.id
+
+        def __hash__(self):
+            return self.id
+
+    class TagChannel:
+        def __init__(self, names):
+            self.available_tags = [Tag(n) for n in names]
+
+    forum = TagChannel(["Feature", "Bug", "Backend", "Frontend", "urgent",
+                        "Question", "📜 Docs", "🔀 PR", "🐙 Issue"])
+    os.environ["PR_FORUM_TAG"] = "🔀 PR"
+    os.environ["ISSUE_FORUM_TAG"] = "🐙 Issue"
+    try:
+        results.append(check("PR 拿到 PR 標籤",
+                             [t.name for t in server.forum_tags(forum, ["Bug"], is_pull=True)],
+                             ["🔀 PR", "Bug"]))
+        results.append(check("issue 拿到 issue 標籤",
+                             [t.name for t in server.forum_tags(forum, ["Bug"], is_pull=False)],
+                             ["🐙 Issue", "Bug"]))
+        # Discord truncates the tag row before the title, so the kind — the one
+        # thing the card cannot show — goes first.
+        results.append(check("種類排在標籤前面",
+                             server.forum_tags(forum, ["Bug"], is_pull=True)[0].name, "🔀 PR"))
+        # Five is Discord's limit; the kind must not be the one that falls off.
+        many = server.forum_tags(
+            forum, ["Bug", "Feature", "Backend", "Frontend", "urgent", "Question"], is_pull=True
+        )
+        results.append(check("超過上限時仍然保住種類", many[0].name, "🔀 PR"))
+        results.append(check("總數不超過 Discord 的上限", len(many), 5))
+        # The regression this guards: recomputing tags from labels alone would
+        # strip the kind tag the first time anybody touched a label.
+        kept = [t for t in forum.available_tags if t.name == "🔀 PR"]
+        results.append(check("改標籤時種類標籤留著",
+                             [t.name for t in server.forum_tags(forum, ["Feature"], keep=kept)],
+                             ["🔀 PR", "Feature"]))
+        results.append(check("種類標籤不會被當成 GitHub label",
+                             server._kind_tag_names(), {"🔀 pr", "🐙 issue"}))
+    finally:
+        os.environ.pop("PR_FORUM_TAG", None)
+        os.environ.pop("ISSUE_FORUM_TAG", None)
+    results.append(check("沒設定就完全不動", server.kind_tag(forum, True), None))
+
     print("\n留言連結 —— 回覆的兩個方向靠它接起來")
     store.remember_comment(777000, "Limatura/tessera", 42, 555)
     results.append(check(

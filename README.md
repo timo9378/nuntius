@@ -27,6 +27,7 @@
 - **GitHub → Discord** — issue 的新留言回到討論串。GitHub 編輯器貼的圖是原始 HTML,會被拆成 Discord 看得懂的形式
 - **在 GitHub 開的新 issue** — 自動在公告頻道長出一張卡和一個討論串,不用手動 `/link`
 - **論壇頻道** — `DEV_ANNOUNCE_CHANNEL_ID` 指向論壇的話就用論壇的方式:一則貼文一張單,GitHub 標籤對應到論壇標籤(`enhancement` → `Feature` 這類名字對不上的有別名表)
+- **PR / issue 分流** — `PR_FORUM_TAG` 和 `ISSUE_FORUM_TAG` 設好之後,每則貼文會多一個「這是什麼」的標籤,論壇列表就篩得動。GitHub 沒有這種 label:在那邊兩者是結構上不同的東西,只有在論壇列表裡這個區別會消失。標籤排在最前面 —— Discord 是先截標籤列再截標題,而五個位置裡這是唯一卡片上看不到的資訊
 - **狀態** — issue 關閉時討論串封存、公告改成「已完成」並附上耗時;重新開啟則反過來
 - **標題和內文** — 雙向。在 GitHub 改標題,討論串跟著改名、卡片跟著改;把討論串改名,issue 的標題跟著改。內文改了卡片也重寫(含圖表和表格)
 - **PR 的 review** — approve 和「要求修改」會進討論串並點名發 PR 的人;程式碼上的行內 review 留言也會,附上檔名和行號。GitHub 唯一有真 threading 的地方就是這裡(`in_reply_to_id`),所以那些回覆到 Discord 是**原生回覆**,不用靠連結繞
